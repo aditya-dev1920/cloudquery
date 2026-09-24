@@ -2,15 +2,18 @@ kind: source
 spec:
   name: aws-client-alpha
   path: cloudquery/aws
-  version: "v34.9.0"
+  registry: github
+  version: "v22.19.2"
   tables: ["*"]
   skip_tables:
     - "aws_cloudtrail_events"
   destinations: ["postgresql"]
   spec:
+    # Cross-Account Audit Configuration:
+    # Target client account must trust this EC2 instance to assume the specified Role ARN
     regions: ["*"]
     accounts:
-      - id: "111122223333"
+      - id: "111122223333" # Target 12-digit AWS Account ID
         role_arn: "arn:aws:iam::111122223333:role/CloudQueryAuditRole"
         external_id: "company-cloudquery-audit-key"
         role_session_name: "AuditScan-Alpha"

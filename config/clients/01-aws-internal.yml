@@ -2,10 +2,12 @@ kind: source
 spec:
   name: aws-internal
   path: cloudquery/aws
-  version: "v34.9.0"
+  registry: github
+  version: "v22.19.2"
   tables: ["*"]
   skip_tables:
     - "aws_cloudtrail_events"
   destinations: ["postgresql"]
   spec:
-    regions: ["us-east-1", "us-west-2"]
+    # Regions to scan: Use ["*"] to crawl all enabled regions, or specify e.g. ["ap-south-1", "us-east-1"]
+    regions: ["*"]

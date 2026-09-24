@@ -6,4 +6,4 @@ spec:
   write_mode: "overwrite-delete-stale"
   send_sync_summary: true
   spec:
-    connection_string: "postgresql://cq_admin:MySecretCQPassword123!@127.0.0.1:5435/cloudquery?sslmode=disable"
+    connection_string: "${CQ_PG_CONNECTION_STRING}"
