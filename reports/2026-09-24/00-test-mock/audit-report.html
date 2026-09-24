@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>AWS Cloud Audit Report - 00-test-mock</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 40px; background: #f8fafc; color: #1e293b; }
+    .card { background: white; padding: 25px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 25px; border: 1px solid #e2e8f0; }
+    h1 { color: #0f172a; margin-top: 0; }
+    .badge-warn { background: #fef2f2; color: #991b1b; padding: 4px 8px; border-radius: 4px; font-weight: bold; border: 1px solid #fecaca; }
+    .badge-ok { background: #f0fdf4; color: #166534; padding: 4px 8px; border-radius: 4px; font-weight: bold; border: 1px solid #bbf7d0; }
+    table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+    th, td { text-align: left; padding: 12px; border-bottom: 1px solid #e2e8f0; }
+    th { background: #f8fafc; font-weight: 600; color: #475569; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🛡️ AWS Cloud Security & Inventory Audit</h1>
+    <p><strong>Target:</strong> 00-test-mock | <strong>Audit Date:</strong> 2026-09-24 | <strong>Engine:</strong> CloudQuery CLI</p>
+  </div>
+  <div class="card">
+    <h2>Discovered Cloud Inventory</h2>
+    <table>
+      <tr><th>Asset Category</th><th>Resource Count</th></tr>
+      <tr><td>EC2 Compute Instances</td><td>0</td></tr>
+      <tr><td>S3 Storage Buckets</td><td>0</td></tr>
+      <tr><td>IAM Roles</td><td>0</td></tr>
+      <tr><td>RDS Databases</td><td>0</td></tr>
+      <tr><td>VPC Networks</td><td>0</td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Security Findings</h2>
+    <table>
+      <tr><th>Security Check</th><th>Status / Findings</th></tr>
+      <tr><td>Unencrypted S3 Buckets</td><td><span class="badge-ok">0 Buckets</span></td></tr>
+      <tr><td>Exposed Security Groups (0.0.0.0/0 on SSH/DB)</td><td><span class="badge-ok">0 Groups</span></td></tr>
+    </table>
+  </div>
+</body>
+</html>

@@ -1,0 +1,8 @@
+kind: source
+spec:
+  name: test-mock
+  path: /home/ubuntu/cloudquery/cache/cq-source-test
+  registry: local
+  tables: ["*"]
+  skip_tables: ["test_paid_table"]
+  destinations: ["postgresql"]

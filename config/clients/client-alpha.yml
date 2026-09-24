@@ -1,0 +1,16 @@
+kind: source
+spec:
+  name: aws-client-alpha
+  path: cloudquery/aws
+  version: "v34.9.0"
+  tables: ["*"]
+  skip_tables:
+    - "aws_cloudtrail_events"
+  destinations: ["postgresql"]
+  spec:
+    regions: ["*"]
+    accounts:
+      - id: "111122223333"
+        role_arn: "arn:aws:iam::111122223333:role/CloudQueryAuditRole"
+        external_id: "company-cloudquery-audit-key"
+        role_session_name: "AuditScan-Alpha"

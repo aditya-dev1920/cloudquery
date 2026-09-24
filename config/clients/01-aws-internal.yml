@@ -1,0 +1,11 @@
+kind: source
+spec:
+  name: aws-internal
+  path: cloudquery/aws
+  version: "v34.9.0"
+  tables: ["*"]
+  skip_tables:
+    - "aws_cloudtrail_events"
+  destinations: ["postgresql"]
+  spec:
+    regions: ["us-east-1", "us-west-2"]

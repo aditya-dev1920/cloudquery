@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cq-postgres-engine
+    restart: always
+    environment:
+      POSTGRES_DB: cloudquery
+      POSTGRES_USER: cq_admin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-MySecretCQPassword123!}
+    volumes:
+      - cq_dedicated_pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5435:5432" # Uses port 5435 to avoid Prowler's 5433
+    networks:
+      - cq_isolated_network
+
+networks:
+  cq_isolated_network:
+    driver: bridge
+
+volumes:
+  cq_dedicated_pgdata:
