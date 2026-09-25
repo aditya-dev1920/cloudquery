@@ -12,7 +12,7 @@ services:
     volumes:
       - cq_dedicated_pgdata:/var/lib/postgresql/data
     ports:
-      - "127.0.0.1:5435:5432" # Uses port 5435 to avoid Prowler's 5433
+      - "127.0.0.1:5435:5432" 
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U cq_admin -d cloudquery"]
       interval: 10s

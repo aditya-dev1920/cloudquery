@@ -51,6 +51,32 @@ if [ -d "${APP_DIR}/cache/plugins" ] && [ ! -w "${APP_DIR}/cache/plugins" ]; the
 fi
 mkdir -p "${APP_DIR}/cache"
 
+# Helper: Serve report directory via temporary HTTP server for 1-click browser download (No PEM/SSH needed)
+serve_download_http() {
+    local SERVE_DIR="$1"
+    local ZIP_NAME="$2"
+    local PORT="${3:-8080}"
+    local TARGET_IP="${HOST_IP:-${EC2_IP:-13.200.216.63}}"
+    
+    echo ""
+    echo "====================================================================="
+    echo "       🌐 1-CLICK BROWSER DOWNLOAD SERVER (NO PEM / NO SSH)          "
+    echo "====================================================================="
+    echo "Open these direct links in your laptop's web browser:"
+    echo ""
+    echo -e "  📦 Download ZIP Bundle:   \033[1;36mhttp://${TARGET_IP}:${PORT}/${ZIP_NAME}\033[0m"
+    echo -e "  📊 View HTML Dashboard:   \033[1;36mhttp://${TARGET_IP}:${PORT}/audit-report.html\033[0m"
+    echo ""
+    echo "Press [Enter] or Ctrl+C to shut down this web server when finished."
+    echo "====================================================================="
+    
+    python3 -m http.server "$PORT" --directory "$SERVE_DIR" >/dev/null 2>&1 &
+    HTTP_PID=$!
+    read -r
+    kill "$HTTP_PID" 2>/dev/null || true
+    echo -e "\033[1;32m[INFO]\033[0m Download web server stopped."
+}
+
 # Helper: Browse and download previously generated reports
 handle_download_menu() {
     echo ""
@@ -104,11 +130,23 @@ handle_download_menu() {
             
             if [ -n "$IMDS_TOKEN" ] && [ "$HOST_IP" != "127.0.0.1" ] && [ "$HOST_IP" != "localhost" ]; then
                 echo -e "\n\033[1;32m[SUCCESS]\033[0m Report bundle ready: $(basename "$ZIP_OUT")"
-                echo "Run this command on your laptop's terminal to download the ZIP package:"
-                echo -e "  \033[1;36mscp -i <YOUR_KEY.pem> ubuntu@${HOST_IP}:${ZIP_OUT} ./\033[0m"
                 echo ""
-                echo "Or download uncompressed folder:"
-                echo -e "  \033[1;36mscp -i <YOUR_KEY.pem> -r ubuntu@${HOST_IP}:${SELECTED_DIR} ./\033[0m"
+                echo "Choose download method:"
+                echo "  [1] Copy via SCP (requires SSH/.pem key)"
+                echo "  [2] Start 1-Click Browser Download Link (NO .pem or SSH needed - Download in Browser)"
+                read -p "Select method [1 or 2, default 2]: " DL_METHOD
+                DL_METHOD=${DL_METHOD:-2}
+                if [ "$DL_METHOD" = "1" ]; then
+                    echo ""
+                    echo "Run this command on your laptop's terminal to download the ZIP package:"
+                    echo -e "  \033[1;36mscp -i <YOUR_KEY.pem> ubuntu@${HOST_IP}:${ZIP_OUT} ./\033[0m"
+                    echo ""
+                    echo "Or without -i if using password/default key:"
+                    echo -e "  \033[1;36mscp ubuntu@${HOST_IP}:${ZIP_OUT} ./\033[0m"
+                    echo ""
+                else
+                    serve_download_http "$SELECTED_DIR" "$(basename "$ZIP_OUT")" 8080
+                fi
             else
                 echo -e "\n\033[1;32m[SUCCESS]\033[0m Report ready locally at: ${SELECTED_DIR}"
                 read -p "Open in browser now? [Y/n]: " OPEN_LOCAL
@@ -126,6 +164,112 @@ handle_download_menu() {
     else
         echo -e "\033[1;31m[ERROR]\033[0m Invalid selection."
         exit 1
+    fi
+}
+
+# Helper: Onboard a new client interactively with verified production template
+handle_client_onboarding() {
+    echo ""
+    echo "======================================================="
+    echo "            ONBOARD NEW CLIENT AWS AUDIT               "
+    echo "======================================================="
+    echo "This wizard creates a production-grade client configuration."
+    echo ""
+    
+    # 1. Client Identifier
+    while true; do
+        read -p "Enter Client Name / Identifier (e.g. client-beta): " NEW_CLIENT_NAME
+        NEW_CLIENT_NAME=$(echo "$NEW_CLIENT_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-_')
+        if [ -n "$NEW_CLIENT_NAME" ]; then
+            break
+        fi
+        echo -e "\033[1;31m[ERROR]\033[0m Client name cannot be empty."
+    done
+    
+    TARGET_YAML="${CONFIG_DIR}/${NEW_CLIENT_NAME}.yml"
+    if [ -f "$TARGET_YAML" ]; then
+        read -p "Configuration '${NEW_CLIENT_NAME}.yml' already exists. Overwrite? [y/N]: " OVERWRITE
+        if [[ ! "$OVERWRITE" =~ ^[Yy]$ ]]; then
+            echo "Onboarding cancelled."
+            exit 0
+        fi
+    fi
+    
+    # 2. AWS Account ID
+    while true; do
+        read -p "Target AWS Account ID (12 digits): " NEW_ACCT_ID
+        NEW_ACCT_ID=$(echo "$NEW_ACCT_ID" | tr -cd '0-9')
+        if [[ "$NEW_ACCT_ID" =~ ^[0-9]{12}$ ]]; then
+            break
+        fi
+        echo -e "\033[1;31m[ERROR]\033[0m Please enter a valid 12-digit AWS Account ID."
+    done
+    
+    # 3. Role ARN
+    DEFAULT_ROLE_ARN="arn:aws:iam::${NEW_ACCT_ID}:role/CloudQueryAuditRole"
+    read -p "Target Role ARN [default: ${DEFAULT_ROLE_ARN}]: " NEW_ROLE_ARN
+    NEW_ROLE_ARN=${NEW_ROLE_ARN:-$DEFAULT_ROLE_ARN}
+    
+    # 4. External ID (Best Practice for Security)
+    read -p "External ID [leave blank if none]: " NEW_EXT_ID
+    
+    # 5. Regions
+    read -p "Regions to scan (* for all, or e.g. ap-south-1) [default: *]: " NEW_REGIONS
+    NEW_REGIONS=${NEW_REGIONS:-*}
+    
+    # Format region YAML array
+    if [ "$NEW_REGIONS" = "*" ]; then
+        REGION_YAML='["*"]'
+    else
+        IFS=',' read -ra ADDR <<< "$NEW_REGIONS"
+        REGION_ARRAY=()
+        for r in "${ADDR[@]}"; do
+            TRIMMED_R=$(echo "$r" | tr -d ' ')
+            REGION_ARRAY+=("\"$TRIMMED_R\"")
+        done
+        REGION_YAML="[$(IFS=, ; echo "${REGION_ARRAY[*]}")]"
+    fi
+    
+    # Write the YAML file
+    cat <<EOF > "$TARGET_YAML"
+kind: source
+spec:
+  name: aws-${NEW_CLIENT_NAME}
+  path: "\${CQ_CACHE_DIR}/cq-source-aws"
+  registry: local
+  tables: ["*"]
+  skip_tables:
+    - "aws_cloudtrail_events"
+    - "aws_s3_bucket_objects"
+  destinations: ["postgresql"]
+  spec:
+    regions: ${REGION_YAML}
+    accounts:
+      - id: "${NEW_ACCT_ID}"
+        role_arn: "${NEW_ROLE_ARN}"
+EOF
+
+    if [ -n "$NEW_EXT_ID" ]; then
+        cat <<EOF >> "$TARGET_YAML"
+        external_id: "${NEW_EXT_ID}"
+EOF
+    fi
+
+    cat <<EOF >> "$TARGET_YAML"
+        role_session_name: "AuditScan-${NEW_CLIENT_NAME}"
+EOF
+
+    echo -e "\n\033[1;32m[SUCCESS]\033[0m Saved client configuration: ${TARGET_YAML}"
+    echo ""
+    read -p "Would you like to run a security audit for '${NEW_CLIENT_NAME}' now? [Y/n]: " RUN_NOW
+    RUN_NOW=${RUN_NOW:-Y}
+    
+    if [[ "$RUN_NOW" =~ ^[Yy]$ ]]; then
+        TARGET_FILES=("$TARGET_YAML")
+        CLIENT_NAME="$NEW_CLIENT_NAME"
+    else
+        echo "Configuration saved. You can audit '${NEW_CLIENT_NAME}' anytime by running: cloudquery-scan"
+        exit 0
     fi
 }
 
@@ -149,9 +293,10 @@ else
         echo "  [$((i+1))] $FNAME"
     done
     echo "  [A] Scan All Clients"
+    echo "  [C] Onboard New Client (Interactive Wizard)"
     echo "  [D] Download / View Past Reports"
     echo ""
-    read -p "Select a client to scan or action [1-${#CLIENT_FILES[@]}, A, or D]: " CHOSEN_INPUT
+    read -p "Select an option [1-${#CLIENT_FILES[@]}, A, C, or D]: " CHOSEN_INPUT
 fi
 
 # Resolve Target Config
@@ -161,6 +306,8 @@ CLIENT_NAME=""
 if [[ "$CHOSEN_INPUT" =~ ^[Dd]$ || "$CHOSEN_INPUT" == "download" ]]; then
     handle_download_menu
     exit 0
+elif [[ "$CHOSEN_INPUT" =~ ^[Cc]$ || "$CHOSEN_INPUT" == "custom" || "$CHOSEN_INPUT" == "onboard" ]]; then
+    handle_client_onboarding
 elif [[ "$CHOSEN_INPUT" =~ ^[Aa]$ || "$CHOSEN_INPUT" == "all" ]]; then
     # Exclude offline test-mock from multi-client production batch scans
     TARGET_FILES=()
@@ -548,9 +695,22 @@ if [ -t 0 ]; then
         echo -e "\n\033[1;32m[SUCCESS]\033[0m Report bundle packaged: $(basename "$ZIP_FILE")"
         if [ "$IS_EC2" = true ]; then
             echo ""
-            echo "Run this command on your laptop's terminal to download the ZIP package:"
-            echo -e "  \033[1;36mscp -i <YOUR_KEY.pem> ubuntu@${EC2_IP}:${ZIP_FILE} ./\033[0m"
-            echo ""
+            echo "Choose download method:"
+            echo "  [1] Copy via SCP (requires SSH/.pem key)"
+            echo "  [2] Start 1-Click Browser Download Link (NO .pem or SSH needed - Download in Browser)"
+            read -p "Select method [1 or 2, default 2]: " DL_METHOD
+            DL_METHOD=${DL_METHOD:-2}
+            if [ "$DL_METHOD" = "1" ]; then
+                echo ""
+                echo "Run this command on your laptop's terminal to download the ZIP package:"
+                echo -e "  \033[1;36mscp -i <YOUR_KEY.pem> ubuntu@${EC2_IP}:${ZIP_FILE} ./\033[0m"
+                echo ""
+                echo "Or without -i if using password/default key:"
+                echo -e "  \033[1;36mscp ubuntu@${EC2_IP}:${ZIP_FILE} ./\033[0m"
+                echo ""
+            else
+                serve_download_http "$REPORT_DIR" "$(basename "$ZIP_FILE")" 8080
+            fi
         else
             echo "Report bundle saved locally at: ${ZIP_FILE}"
             read -p "Open HTML report in browser now? [Y/n]: " OPEN_LOCAL

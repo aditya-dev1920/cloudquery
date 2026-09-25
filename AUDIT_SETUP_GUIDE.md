@@ -92,34 +92,102 @@ Since you are on your local machine, **no `scp` is needed**:
 
 ---
 
-## 🏢 Adding a New Client Account for Auditing
+## 🏢 Cross-Account Client Audits (Executing Client IAM Roles via ARN)
 
-To add a new customer or subsidiary AWS account:
+To audit a client's AWS infrastructure (or multiple client accounts), CloudQuery uses **AWS Security Token Service (STS) `AssumeRole`**:
 
-1. Create a new config file in `config/clients/` (e.g. `config/clients/client-beta.yml`):
-   ```yaml
-   kind: source
-   spec:
-     name: aws-client-beta
-     path: "${CQ_CACHE_DIR}/cq-source-aws"
-     registry: local
-     tables: ["*"]
-     skip_tables:
-       - "aws_cloudtrail_events"
-       - "aws_s3_bucket_objects"
-     destinations: ["postgresql"]
-     spec:
-       regions: ["*"]
-       accounts:
-         - id: "123456789012"
-           role_arn: "arn:aws:iam::123456789012:role/CloudQueryAuditRole"
-           external_id: "client-unique-secret-key"
-           role_session_name: "AuditScan-Beta"
-   ```
-2. The client simply needs to create an IAM role in their AWS account named `CloudQueryAuditRole` that:
-   * Attaches the AWS Managed Policy **`SecurityAudit`**.
-   * Sets Trust Policy to allow your scanner's AWS Account ID or Role to assume it.
-3. Run `cloudquery-scan` and your new client will automatically show in the selection menu!
+### How It Works Under the Hood:
+1. **Scanner Base Identity**: 
+   * **On Local Laptop:** Your base AWS credentials (via `aws configure` or `.env` `AWS_ACCESS_KEY_ID`).
+   * **On EC2:** The EC2 Instance Profile attached to your scanner instance.
+2. **Target Client Identity**:
+   * The client creates an IAM Role in their AWS account (e.g. `arn:aws:iam::123456789012:role/CloudQueryAuditRole`).
+3. **STS AssumeRole Handshake**:
+   * CloudQuery takes your base credentials and calls AWS STS to assume the client's role using their ARN and `external_id`.
+   * STS verifies the client's trust policy and returns temporary 1-hour credentials.
+   * CloudQuery crawls all assets in the client account and writes them directly into PostgreSQL.
+
+---
+
+### Step-by-Step Production Setup for Client Accounts
+
+#### Step 1: Give This Trust Policy to the Client's AWS Admin
+The client creates an IAM role named `CloudQueryAuditRole` with this **Trust Relationship**:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowAuditorToAssumeRole",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<YOUR_AUDITOR_ACCOUNT_ID>:root"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "company-client-unique-secret-key"
+        }
+      }
+    }
+  ]
+}
+```
+> [!IMPORTANT]
+> Always enforce `sts:ExternalId` in client trust policies. This protects both you and the client against the AWS "Confused Deputy" vulnerability.
+
+#### Step 2: Permissions Policy on Client Role
+Attach the official AWS Managed Policy:
+* **`arn:aws:iam::aws:policy/SecurityAudit`**
+
+#### Step 3: Create the Client Config in Your Scanner
+Create `config/clients/client-<client-name>.yml`:
+```yaml
+kind: source
+spec:
+  name: aws-client-<name>
+  path: "${CQ_CACHE_DIR}/cq-source-aws"
+  registry: local
+  tables: ["*"]
+  skip_tables:
+    - "aws_cloudtrail_events"
+    - "aws_s3_bucket_objects"
+  destinations: ["postgresql"]
+  spec:
+    regions: ["*"] # Or specify e.g. ["ap-south-1", "us-east-1"]
+    accounts:
+      - id: "<CLIENT_12_DIGIT_ACCOUNT_ID>"
+        role_arn: "arn:aws:iam::<CLIENT_12_DIGIT_ACCOUNT_ID>:role/CloudQueryAuditRole"
+        external_id: "company-client-unique-secret-key"
+        role_session_name: "AuditScan-<name>"
+```
+
+#### Step 4: Run the Audit
+Run `cloudquery-scan` and your new client will automatically appear in the interactive menu!
+
+---
+
+## 📥 Downloading Reports Without a PEM File
+
+When running scans on the remote EC2 server, you have two ways to get reports onto your laptop:
+
+### Method 1: 1-Click Browser Download Link (No PEM / No SSH Required!)
+When bundling a report (or selecting `[D]` for past reports), select **Option 2 (Web Download)**:
+* It temporarily starts a lightweight Python download server on port 8080.
+* Open the displayed link in your laptop's browser:
+  `http://13.200.216.63:8080/audit-bundle-....zip`
+* Click to download the ZIP file directly.
+* Press Enter in your terminal to shut down the web server when done.
+
+### Method 2: SCP Command (For users with SSH access)
+```bash
+# With PEM key:
+scp -i <YOUR_KEY.pem> ubuntu@13.200.216.63:/home/ubuntu/cloudquery/reports/<DATE>/<CLIENT>/audit-bundle-...zip ./
+
+# Without PEM key (Password or default ~/.ssh key):
+scp ubuntu@13.200.216.63:/home/ubuntu/cloudquery/reports/<DATE>/<CLIENT>/audit-bundle-...zip ./
+```
 
 ---
 
