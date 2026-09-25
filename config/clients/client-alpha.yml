@@ -1,12 +1,12 @@
 kind: source
 spec:
   name: aws-client-alpha
-  path: cloudquery/aws
-  registry: github
-  version: "v22.19.2"
+  path: "${CQ_CACHE_DIR}/cq-source-aws"
+  registry: local
   tables: ["*"]
   skip_tables:
     - "aws_cloudtrail_events"
+    - "aws_s3_bucket_objects"
   destinations: ["postgresql"]
   spec:
     # Cross-Account Audit Configuration:

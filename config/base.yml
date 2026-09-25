@@ -1,7 +1,7 @@
 kind: destination
 spec:
   name: postgresql
-  path: /home/ubuntu/cloudquery/cache/cq-destination-postgresql
+  path: "${CQ_CACHE_DIR}/cq-destination-postgresql"
   registry: local
   write_mode: "overwrite-delete-stale"
   send_sync_summary: true

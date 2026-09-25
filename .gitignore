@@ -38,3 +38,8 @@ cli/cloudquery-sync-summary.json
 __debug_bin*
 coverage.out.tmp
 coverage.out
+
+# Runtime Reports and Large Binary Caches
+reports/
+logs/
+cache/cq-source-aws

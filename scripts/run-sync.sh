@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-APP_DIR="/home/ubuntu/cloudquery"
+REAL_SCRIPT="$(realpath "${BASH_SOURCE[0]}")"
+APP_DIR="$(cd "$(dirname "$REAL_SCRIPT")/.." && pwd)"
 CONFIG_DIR="${APP_DIR}/config/clients"
 BASE_CONFIG="${APP_DIR}/config/base.yml"
 REPORTS_ROOT="${APP_DIR}/reports"
+export CQ_CACHE_DIR="${CQ_CACHE_DIR:-${APP_DIR}/cache}"
 DATE=$(date +%Y-%m-%d)
 TIMESTAMP=$(date +%H-%M-%S)
 LOCK_FILE="/tmp/cloudquery-sync.lock"
@@ -49,6 +51,84 @@ if [ -d "${APP_DIR}/cache/plugins" ] && [ ! -w "${APP_DIR}/cache/plugins" ]; the
 fi
 mkdir -p "${APP_DIR}/cache"
 
+# Helper: Browse and download previously generated reports
+handle_download_menu() {
+    echo ""
+    echo "======================================================="
+    echo "            BROWSE & DOWNLOAD PAST REPORTS             "
+    echo "======================================================="
+    
+    # Find all generated audit-report.html files
+    PAST_REPORTS=($(find "$REPORTS_ROOT" -type f -name "audit-report.html" 2>/dev/null | sort -r))
+    
+    if [ ${#PAST_REPORTS[@]} -eq 0 ]; then
+        echo -e "\033[1;33m[NOTICE]\033[0m No audit reports found in $REPORTS_ROOT yet."
+        echo "         Run a scan first to generate reports."
+        exit 0
+    fi
+    
+    echo "Available Audit Reports:"
+    for idx in "${!PAST_REPORTS[@]}"; do
+        R_FILE="${PAST_REPORTS[$idx]}"
+        R_DIR="$(dirname "$R_FILE")"
+        R_CLIENT="$(basename "$R_DIR")"
+        R_DATE="$(basename "$(dirname "$R_DIR")")"
+        echo "  [$((idx+1))] Date: ${R_DATE} | Client: ${R_CLIENT}"
+    done
+    echo "  [B] Back / Exit"
+    echo ""
+    
+    read -p "Select a report to download [1-${#PAST_REPORTS[@]} or B]: " R_CHOICE
+    
+    if [[ "$R_CHOICE" =~ ^[Bb]$ || -z "$R_CHOICE" ]]; then
+        echo "Exiting report browser."
+        exit 0
+    fi
+    
+    if [[ "$R_CHOICE" =~ ^[0-9]+$ ]] && [ "$R_CHOICE" -ge 1 ] && [ "$R_CHOICE" -le ${#PAST_REPORTS[@]} ]; then
+        SELECTED_HTML="${PAST_REPORTS[$((R_CHOICE-1))]}"
+        SELECTED_DIR="$(dirname "$SELECTED_HTML")"
+        SEL_CLIENT="$(basename "$SELECTED_DIR")"
+        SEL_DATE="$(basename "$(dirname "$SELECTED_DIR")")"
+        
+        echo ""
+        read -p "Download report package for '${SEL_CLIENT}' (${SEL_DATE})? [Y/n]: " DO_BUNDLE
+        DO_BUNDLE=${DO_BUNDLE:-Y}
+        
+        if [[ "$DO_BUNDLE" =~ ^[Yy]$ ]]; then
+            ZIP_OUT="${SELECTED_DIR}/audit-bundle-${SEL_CLIENT}-${SEL_DATE}.zip"
+            (cd "$(dirname "$SELECTED_DIR")" && zip -r -q "$ZIP_OUT" "$(basename "$SELECTED_DIR")")
+            
+            IMDS_TOKEN=$(curl -s -m 1 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+            HOST_IP=$(curl -s -m 1 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || curl -s -m 2 http://checkip.amazonaws.com 2>/dev/null || echo "13.200.216.63")
+            
+            if [ -n "$IMDS_TOKEN" ] && [ "$HOST_IP" != "127.0.0.1" ] && [ "$HOST_IP" != "localhost" ]; then
+                echo -e "\n\033[1;32m[SUCCESS]\033[0m Report bundle ready: $(basename "$ZIP_OUT")"
+                echo "Run this command on your laptop's terminal to download the ZIP package:"
+                echo -e "  \033[1;36mscp -i <YOUR_KEY.pem> ubuntu@${HOST_IP}:${ZIP_OUT} ./\033[0m"
+                echo ""
+                echo "Or download uncompressed folder:"
+                echo -e "  \033[1;36mscp -i <YOUR_KEY.pem> -r ubuntu@${HOST_IP}:${SELECTED_DIR} ./\033[0m"
+            else
+                echo -e "\n\033[1;32m[SUCCESS]\033[0m Report ready locally at: ${SELECTED_DIR}"
+                read -p "Open in browser now? [Y/n]: " OPEN_LOCAL
+                OPEN_LOCAL=${OPEN_LOCAL:-Y}
+                if [[ "$OPEN_LOCAL" =~ ^[Yy]$ ]]; then
+                    if [[ "$OSTYPE" == "darwin"* ]]; then
+                        open "${SELECTED_HTML}"
+                    elif command -v xdg-open >/dev/null 2>&1; then
+                        xdg-open "${SELECTED_HTML}"
+                    fi
+                fi
+            fi
+        fi
+        exit 0
+    else
+        echo -e "\033[1;31m[ERROR]\033[0m Invalid selection."
+        exit 1
+    fi
+}
+
 # 2. Interactive Client Selection
 CLIENT_FILES=($(find "$CONFIG_DIR" -maxdepth 1 \( -name "*.yml" -o -name "*.yaml" \) 2>/dev/null | sort))
 
@@ -69,16 +149,29 @@ else
         echo "  [$((i+1))] $FNAME"
     done
     echo "  [A] Scan All Clients"
+    echo "  [D] Download / View Past Reports"
     echo ""
-    read -p "Select a client to scan [1-${#CLIENT_FILES[@]} or A]: " CHOSEN_INPUT
+    read -p "Select a client to scan or action [1-${#CLIENT_FILES[@]}, A, or D]: " CHOSEN_INPUT
 fi
 
 # Resolve Target Config
 TARGET_FILES=()
 CLIENT_NAME=""
 
-if [[ "$CHOSEN_INPUT" =~ ^[Aa]$ || "$CHOSEN_INPUT" == "all" ]]; then
-    TARGET_FILES=("${CLIENT_FILES[@]}")
+if [[ "$CHOSEN_INPUT" =~ ^[Dd]$ || "$CHOSEN_INPUT" == "download" ]]; then
+    handle_download_menu
+    exit 0
+elif [[ "$CHOSEN_INPUT" =~ ^[Aa]$ || "$CHOSEN_INPUT" == "all" ]]; then
+    # Exclude offline test-mock from multi-client production batch scans
+    TARGET_FILES=()
+    for f in "${CLIENT_FILES[@]}"; do
+        if [[ "$(basename "$f")" != *"test-mock"* ]]; then
+            TARGET_FILES+=("$f")
+        fi
+    done
+    if [ ${#TARGET_FILES[@]} -eq 0 ]; then
+        TARGET_FILES=("${CLIENT_FILES[@]}")
+    fi
     CLIENT_NAME="all-clients"
 elif [[ "$CHOSEN_INPUT" =~ ^[0-9]+$ ]] && [ "$CHOSEN_INPUT" -ge 1 ] && [ "$CHOSEN_INPUT" -le ${#CLIENT_FILES[@]} ]; then
     TARGET_FILES=("${CLIENT_FILES[$((CHOSEN_INPUT-1))]}")
@@ -99,8 +192,9 @@ mkdir -p "$REPORT_DIR" "${APP_DIR}/logs"
 SUMMARY_FILE="${REPORT_DIR}/summary.jsonl"
 LOG_FILE="${APP_DIR}/logs/sync_${CLIENT_NAME}_${DATE}_${TIMESTAMP}.log"
 
-# Housekeeping: prune sync logs older than 30 days
+# Housekeeping: prune sync logs older than 30 days and audit reports older than 60 days
 find "${APP_DIR}/logs" -type f -name "sync_*.log" -mtime +30 -delete 2>/dev/null || true
+find "${REPORTS_ROOT}" -mindepth 1 -maxdepth 1 -type d -mtime +60 -exec rm -rf {} + 2>/dev/null || true
 
 echo -e "\n\033[1;32m[INFO]\033[0m Starting scan for: \033[1m${CLIENT_NAME}\033[0m"
 
@@ -122,6 +216,37 @@ if [ "$NEEDS_CQ_HUB" = true ] && [ -z "$CLOUDQUERY_API_KEY" ]; then
     echo ""
 fi
 
+# Auto-resolve local AWS plugin if required and missing
+for target in "${TARGET_FILES[@]}"; do
+    if grep -q "cq-source-aws" "$target" 2>/dev/null && [ ! -x "${CQ_CACHE_DIR}/cq-source-aws" ]; then
+        echo -e "\033[1;33m[INFO]\033[0m Local AWS plugin not found in ${CQ_CACHE_DIR}. Auto-downloading open-source v22.19.2..."
+        OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+            x86_64) ARCH="amd64" ;;
+            aarch64|arm64) ARCH="arm64" ;;
+        esac
+        DOWNLOAD_URL="https://github.com/cloudquery/cloudquery/releases/download/plugins-source-aws-v22.19.2/aws_${OS}_${ARCH}.zip"
+        echo "       Downloading from: $DOWNLOAD_URL"
+        TMP_ZIP="/tmp/cq_aws_${OS}_${ARCH}.zip"
+        if curl -sSL -o "$TMP_ZIP" "$DOWNLOAD_URL"; then
+            mkdir -p /tmp/cq_aws_extracted
+            unzip -q -o "$TMP_ZIP" -d /tmp/cq_aws_extracted
+            EXTRACTED_BIN=$(find /tmp/cq_aws_extracted -type f -name "plugin*" | head -n 1)
+            if [ -n "$EXTRACTED_BIN" ]; then
+                mv "$EXTRACTED_BIN" "${CQ_CACHE_DIR}/cq-source-aws"
+                chmod +x "${CQ_CACHE_DIR}/cq-source-aws"
+                echo -e "\033[1;32m[SUCCESS]\033[0m AWS plugin installed to ${CQ_CACHE_DIR}/cq-source-aws"
+            fi
+            rm -rf "$TMP_ZIP" /tmp/cq_aws_extracted
+        else
+            echo -e "\033[1;31m[ERROR]\033[0m Failed to download AWS plugin. Please verify internet connection."
+            exit 1
+        fi
+        break
+    fi
+done
+
 # 3. Execute CloudQuery Sync
 CQ_DIR="${CQ_CACHE_DIR:-${HOME}/.cq}"
 mkdir -p "$CQ_DIR"
@@ -141,7 +266,7 @@ if [ $SYNC_EXIT -ne 0 ]; then
         echo -e "\n\033[1;33m[AWS AUTHENTICATION REQUIRED]\033[0m"
         echo "The AWS plugin requires credentials to crawl your cloud resources:"
         echo "  • Option 1 (Recommended for EC2): Attach an IAM Role to this EC2 instance in AWS Console"
-        echo "      (EC2 -> Instances -> Actions -> Security -> Modify IAM Role -> attach role with ReadOnlyAccess)"
+        echo "      (EC2 -> Instances -> Actions -> Security -> Modify IAM Role -> attach role with ReadOnlyAccess/SecurityAudit)"
         echo "  • Option 2: Add static IAM access keys to ${APP_DIR}/.env:"
         echo "      AWS_ACCESS_KEY_ID=AKIA..."
         echo "      AWS_SECRET_ACCESS_KEY=..."
@@ -217,6 +342,12 @@ docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
       OR perm->>'IpProtocol' = '-1' OR perm->>'ip_protocol' = '-1'
     )
 ) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/open_security_groups.csv" 2>/dev/null || true
+
+docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
+\copy (SELECT account_id, region, db_instance_identifier, db_instance_class, engine, engine_version, db_instance_status FROM aws_rds_instances) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/rds_inventory.csv" 2>/dev/null || true
+
+docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
+\copy (SELECT account_id, arn, role_name, create_date FROM aws_iam_roles) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/iam_roles.csv" 2>/dev/null || true
 
 # 6. Generate Self-Contained HTML Report
 if [ "$CLIENT_NAME" = "00-test-mock" ]; then
@@ -296,13 +427,25 @@ cat <<EOF > "${REPORT_DIR}/audit-report.html"
       <tr><td>Exposed Security Groups (0.0.0.0/0 on SSH/DB)</td><td><span class="$([ $(echo $OPEN_SG | tr -d ' ') -gt 0 ] && echo 'badge-warn' || echo 'badge-ok')">$(echo $OPEN_SG | tr -d ' ') Groups</span></td></tr>
     </table>
   </div>
+  <div class="card">
+    <h2>Detailed CSV Exports</h2>
+    <p>The following detailed CSV finding exports were generated alongside this report:</p>
+    <ul>
+      <li><a href="open_security_groups.csv"><strong>open_security_groups.csv</strong></a> — Exposed security groups allowing 0.0.0.0/0</li>
+      <li><a href="unencrypted_s3_buckets.csv"><strong>unencrypted_s3_buckets.csv</strong></a> — Buckets missing server-side encryption</li>
+      <li><a href="ec2_inventory.csv"><strong>ec2_inventory.csv</strong></a> — Complete compute instance inventory</li>
+      <li><a href="rds_inventory.csv"><strong>rds_inventory.csv</strong></a> — Managed RDS database instances</li>
+      <li><a href="iam_roles.csv"><strong>iam_roles.csv</strong></a> — IAM roles inventory</li>
+    </ul>
+  </div>
 </body>
 </html>
 EOF
 fi
 
 # 7. Print Terminal Summary Dashboard
-EC2_IP=$(curl -s -m 2 http://checkip.amazonaws.com 2>/dev/null || echo "<YOUR_EC2_IP>")
+IMDS_TOKEN=$(curl -s -m 1 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+EC2_IP=$(curl -s -m 1 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || curl -s -m 2 http://checkip.amazonaws.com 2>/dev/null || echo "13.200.216.63")
 
 if [ "$CLIENT_NAME" = "00-test-mock" ]; then
 cat <<EOF
@@ -318,8 +461,8 @@ cat <<EOF
 ║   • PostgreSQL Destination:       ✅ Functional                                 ║
 ║   • Mock Records Synced:          $(printf "%-5s" $(echo $MOCK_COUNT | tr -d ' ')) rows                               ║
 ╠═════════════════════════════════════════════════════════════════════════════════╣
-║ NOTE: This was an offline mock test run. To scan live AWS resources, configure  ║
-║ your CLOUDQUERY_API_KEY in .env and select [2] 01-aws-internal or [3] client.   ║
+║ NOTE: This was an offline mock test run. To scan live AWS resources, ensure    ║
+║ your IAM role is attached and select [2] 01-aws-internal or [3] client.       ║
 ╚═════════════════════════════════════════════════════════════════════════════════╝
 EOF
 else
@@ -343,6 +486,14 @@ cat <<EOF
 ╚═════════════════════════════════════════════════════════════════════════════════╝
 EOF
 fi
+
+# Detect environment (EC2 vs Local)
+IS_EC2=false
+if [ -n "$IMDS_TOKEN" ] && [ "$EC2_IP" != "127.0.0.1" ] && [ "$EC2_IP" != "localhost" ]; then
+    IS_EC2=true
+fi
+
+if [ "$IS_EC2" = true ]; then
 cat <<EOF
 
 =======================================================
@@ -353,9 +504,65 @@ Reports generated at: ${REPORT_DIR}
   • unencrypted_s3_buckets.csv (CSV finding list)
   • open_security_groups.csv   (Exposed Security Groups finding list)
   • ec2_inventory.csv          (Complete asset list)
+  • rds_inventory.csv          (RDS database list)
+  • iam_roles.csv              (IAM roles list)
 
-Run this command on your laptop's terminal to download:
+Run on your laptop's terminal to download:
+
+  [Recommended] Download FULL report bundle (HTML + all CSV exports):
+  scp -i <YOUR_KEY.pem> -r ubuntu@${EC2_IP}:${REPORT_DIR} ./
+
+  [Alternative] Download only the HTML report:
   scp -i <YOUR_KEY.pem> ubuntu@${EC2_IP}:${REPORT_DIR}/audit-report.html .
 
 EOF
+else
+cat <<EOF
+
+=======================================================
+📊 AUDIT REPORT READY (LOCAL ENVIRONMENT)
+=======================================================
+Reports generated at: ${REPORT_DIR}
+  • audit-report.html          (Styled Executive Report)
+  • unencrypted_s3_buckets.csv (CSV finding list)
+  • open_security_groups.csv   (Exposed Security Groups finding list)
+  • ec2_inventory.csv          (Complete asset list)
+  • rds_inventory.csv          (RDS database list)
+  • iam_roles.csv              (IAM roles list)
+
+Open the report directly in your browser:
+  • macOS:   open "${REPORT_DIR}/audit-report.html"
+  • Linux:   xdg-open "${REPORT_DIR}/audit-report.html"
+  • Windows: start "${REPORT_DIR}/audit-report.html"
+
+EOF
+fi
+
+if [ -t 0 ]; then
+    echo ""
+    read -p "Would you like to bundle this report for download? [Y/n]: " DOWNLOAD_PROMPT
+    DOWNLOAD_PROMPT=${DOWNLOAD_PROMPT:-Y}
+    if [[ "$DOWNLOAD_PROMPT" =~ ^[Yy]$ ]]; then
+        ZIP_FILE="${REPORT_DIR}/audit-bundle-${CLIENT_NAME}-${DATE}.zip"
+        (cd "$(dirname "$REPORT_DIR")" && zip -r -q "$ZIP_FILE" "$(basename "$REPORT_DIR")")
+        echo -e "\n\033[1;32m[SUCCESS]\033[0m Report bundle packaged: $(basename "$ZIP_FILE")"
+        if [ "$IS_EC2" = true ]; then
+            echo ""
+            echo "Run this command on your laptop's terminal to download the ZIP package:"
+            echo -e "  \033[1;36mscp -i <YOUR_KEY.pem> ubuntu@${EC2_IP}:${ZIP_FILE} ./\033[0m"
+            echo ""
+        else
+            echo "Report bundle saved locally at: ${ZIP_FILE}"
+            read -p "Open HTML report in browser now? [Y/n]: " OPEN_LOCAL
+            OPEN_LOCAL=${OPEN_LOCAL:-Y}
+            if [[ "$OPEN_LOCAL" =~ ^[Yy]$ ]]; then
+                if [[ "$OSTYPE" == "darwin"* ]]; then
+                    open "${REPORT_DIR}/audit-report.html"
+                elif command -v xdg-open >/dev/null 2>&1; then
+                    xdg-open "${REPORT_DIR}/audit-report.html"
+                fi
+            fi
+        fi
+    fi
+fi
 
