@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
+# This script orchestrates the CloudQuery sync process, including environment setup, client selection, and report generation. It ensures that only one instance runs at a time and provides interactive options for onboarding new clients or downloading past reports.
 REAL_SCRIPT="$(realpath "${BASH_SOURCE[0]}")"
 APP_DIR="$(cd "$(dirname "$REAL_SCRIPT")/.." && pwd)"
 CONFIG_DIR="${APP_DIR}/config/clients"
@@ -38,11 +39,33 @@ if ! docker ps --format '{{.Names}}' | grep -q "^cq-postgres-engine$"; then
     done
 fi
 
-# Verify CLI binary exists
+# Verify CLI binary exists (auto-compile if missing)
 if [ ! -x "$CQ_CLI" ]; then
-    echo -e "\033[1;31m[ERROR]\033[0m CloudQuery CLI not found at $CQ_CLI"
-    echo "       Build it with: cd ${APP_DIR}/cli && go build -o ${CQ_CLI} ."
-    exit 1
+    if command -v go >/dev/null 2>&1 && [ -d "${APP_DIR}/cli" ]; then
+        echo -e "\033[1;33m[INFO]\033[0m CloudQuery CLI binary not found. Compiling open-source CLI from ./cli..."
+        (cd "${APP_DIR}/cli" && go build -o "$CQ_CLI" .)
+        chmod +x "$CQ_CLI"
+        echo -e "\033[1;32m[SUCCESS]\033[0m CloudQuery CLI compiled successfully to $CQ_CLI"
+    else
+        echo -e "\033[1;31m[ERROR]\033[0m CloudQuery CLI not found at $CQ_CLI"
+        echo "       Please install Go (golang.org) or build it manually: cd ${APP_DIR}/cli && go build -o ${CQ_CLI} ."
+        exit 1
+    fi
+fi
+
+# Auto-resolve PostgreSQL destination plugin (auto-compile if missing)
+PG_DEST_BIN="${CQ_CACHE_DIR}/cq-destination-postgresql"
+if [ ! -x "$PG_DEST_BIN" ]; then
+    if command -v go >/dev/null 2>&1 && [ -d "${APP_DIR}/plugins/destination/postgresql" ]; then
+        echo -e "\033[1;33m[INFO]\033[0m PostgreSQL destination plugin not found. Compiling from ./plugins/destination/postgresql..."
+        (cd "${APP_DIR}/plugins/destination/postgresql" && go build -o "$PG_DEST_BIN" .)
+        chmod +x "$PG_DEST_BIN"
+        echo -e "\033[1;32m[SUCCESS]\033[0m PostgreSQL destination plugin compiled successfully to $PG_DEST_BIN"
+    else
+        echo -e "\033[1;31m[ERROR]\033[0m PostgreSQL destination plugin not found at $PG_DEST_BIN"
+        echo "       Please build it with: cd ${APP_DIR}/plugins/destination/postgresql && go build -o ${PG_DEST_BIN} ."
+        exit 1
+    fi
 fi
 
 # Ensure cache directory is clean and writable by the current user
@@ -376,6 +399,28 @@ else
     fi
 fi
 
+# Resolve source names for database tenant isolation
+SOURCE_NAMES=()
+for tf in "${TARGET_FILES[@]}"; do
+    sname=$(awk -F: '/^[[:space:]]*name:[[:space:]]*/ {gsub(/^[[:space:]]+|[[:space:]]+$|["'\''"]/, "", $2); print $2; exit}' "$tf" 2>/dev/null)
+    if [ -n "$sname" ]; then
+        SOURCE_NAMES+=("'$sname'")
+    fi
+done
+
+CQ_WHERE=""
+CQ_AND=""
+CQ_AND_B=""
+CQ_AND_SG=""
+
+if [ ${#SOURCE_NAMES[@]} -gt 0 ]; then
+    SOURCES_LIST=$(IFS=,; echo "${SOURCE_NAMES[*]}")
+    CQ_WHERE="WHERE _cq_source_name IN (${SOURCES_LIST})"
+    CQ_AND="AND _cq_source_name IN (${SOURCES_LIST})"
+    CQ_AND_B="AND b._cq_source_name IN (${SOURCES_LIST})"
+    CQ_AND_SG="AND sg._cq_source_name IN (${SOURCES_LIST})"
+fi
+
 REPORT_DIR="${REPORTS_ROOT}/${DATE}/${CLIENT_NAME}"
 mkdir -p "$REPORT_DIR" "${APP_DIR}/logs"
 SUMMARY_FILE="${REPORT_DIR}/summary.jsonl"
@@ -436,6 +481,22 @@ for target in "${TARGET_FILES[@]}"; do
     fi
 done
 
+# Auto-resolve local Test mock plugin if required and missing
+for target in "${TARGET_FILES[@]}"; do
+    if grep -q "cq-source-test" "$target" 2>/dev/null && [ ! -x "${CQ_CACHE_DIR}/cq-source-test" ]; then
+        if command -v go >/dev/null 2>&1 && [ -d "${APP_DIR}/plugins/source/test" ]; then
+            echo -e "\033[1;33m[INFO]\033[0m Test mock plugin not found in ${CQ_CACHE_DIR}. Auto-compiling from ./plugins/source/test..."
+            (cd "${APP_DIR}/plugins/source/test" && go build -o "${CQ_CACHE_DIR}/cq-source-test" .)
+            chmod +x "${CQ_CACHE_DIR}/cq-source-test"
+            echo -e "\033[1;32m[SUCCESS]\033[0m Test mock plugin compiled successfully to ${CQ_CACHE_DIR}/cq-source-test"
+        else
+            echo -e "\033[1;31m[ERROR]\033[0m Test mock plugin not found at ${CQ_CACHE_DIR}/cq-source-test"
+            exit 1
+        fi
+        break
+    fi
+done
+
 # 3. Execute CloudQuery Sync
 CQ_DIR="${CQ_CACHE_DIR:-${HOME}/.cq}"
 mkdir -p "$CQ_DIR"
@@ -451,7 +512,28 @@ SYNC_EXIT=${PIPESTATUS[0]}
 
 if [ $SYNC_EXIT -ne 0 ]; then
     echo -e "\n\033[1;31m[ERROR]\033[0m Sync failed with exit code $SYNC_EXIT. Check log: $LOG_FILE"
-    if grep -Eq "no EC2 IMDS role found|error retrieving AWS credentials" "$LOG_FILE" 2>/dev/null; then
+    if grep -Eq "AccessDenied.*sts:AssumeRole|not authorized to perform: sts:AssumeRole|failed to assume role" "$LOG_FILE" 2>/dev/null; then
+        echo -e "\n\033[1;31m[AWS CROSS-ACCOUNT ASSUMEROLE FAILED]\033[0m"
+        echo "The scanner could not assume the target client's IAM Role."
+        echo "Please verify the following settings in the client's AWS account:"
+        echo "  1. Target Role ARN:"
+        echo "     Confirm 'role_arn' in ${CONFIG_DIR}/${CLIENT_NAME}.yml exists and matches the client's IAM Role."
+        echo "  2. Client Role Trust Policy (Trust Relationship):"
+        echo "     The client's IAM Role must allow 'sts:AssumeRole' from this scanner."
+        echo "     Example Trust Policy on Client's IAM Role:"
+        echo "     {"
+        echo "       \"Version\": \"2012-10-17\","
+        echo "       \"Statement\": [{"
+        echo "         \"Effect\": \"Allow\","
+        echo "         \"Principal\": { \"AWS\": \"arn:aws:iam::<SCANNER_ACCOUNT_ID>:root\" },"
+        echo "         \"Action\": \"sts:AssumeRole\","
+        echo "         \"Condition\": { \"StringEquals\": { \"sts:ExternalId\": \"<YOUR_EXTERNAL_ID>\" } }"
+        echo "       }]"
+        echo "     }"
+        echo "  3. External ID Mismatch:"
+        echo "     If the client role enforces an ExternalId condition, confirm it matches 'external_id' in your config."
+        echo ""
+    elif grep -Eq "no EC2 IMDS role found|error retrieving AWS credentials" "$LOG_FILE" 2>/dev/null; then
         echo -e "\n\033[1;33m[AWS AUTHENTICATION REQUIRED]\033[0m"
         echo "The AWS plugin requires credentials to crawl your cloud resources:"
         echo "  • Option 1 (Recommended for EC2): Attach an IAM Role to this EC2 instance in AWS Console"
@@ -461,6 +543,10 @@ if [ $SYNC_EXIT -ne 0 ]; then
         echo "      AWS_SECRET_ACCESS_KEY=..."
         echo "      AWS_DEFAULT_REGION=us-east-1"
         echo ""
+    elif grep -Eq "InvalidClientTokenId|SignatureDoesNotMatch" "$LOG_FILE" 2>/dev/null; then
+        echo -e "\n\033[1;31m[AWS CREDENTIAL ERROR]\033[0m"
+        echo "AWS rejected the credentials or access key. Please verify key validity and system clock synchronization."
+        echo ""
     fi
     exit $SYNC_EXIT
 fi
@@ -469,27 +555,35 @@ fi
 echo -e "\n[INFO] Compiling security audit and inventory data..."
 
 if [ "$CLIENT_NAME" = "00-test-mock" ]; then
-    MOCK_COUNT=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT COALESCE((SELECT count(*) FROM test_some_table),0) + COALESCE((SELECT count(*) FROM test_sub_table),0) + COALESCE((SELECT count(*) FROM test_testdata_table),0);" 2>/dev/null || echo "12")
+    MOCK_COUNT=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT COALESCE((SELECT count(*) FROM test_some_table ${CQ_WHERE}),0) + COALESCE((SELECT count(*) FROM test_sub_table ${CQ_WHERE}),0) + COALESCE((SELECT count(*) FROM test_testdata_table ${CQ_WHERE}),0);" 2>/dev/null || echo "12")
     MOCK_COUNT=${MOCK_COUNT//[[:space:]]/}
     MOCK_COUNT=${MOCK_COUNT:-12}
 else
-    EC2_COUNT=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_ec2_instances;" 2>/dev/null || echo "0")
+    EC2_COUNT=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_ec2_instances ${CQ_WHERE};" 2>/dev/null || echo "0")
     EC2_COUNT=${EC2_COUNT//[[:space:]]/}
     EC2_COUNT=${EC2_COUNT:-0}
 
-    S3_COUNT=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_s3_buckets;" 2>/dev/null || echo "0")
+    S3_COUNT=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_s3_buckets ${CQ_WHERE};" 2>/dev/null || echo "0")
     S3_COUNT=${S3_COUNT//[[:space:]]/}
     S3_COUNT=${S3_COUNT:-0}
 
-    IAM_ROLE_COUNT=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_iam_roles;" 2>/dev/null || echo "0")
+    IAM_ROLE_COUNT=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_iam_roles ${CQ_WHERE};" 2>/dev/null || echo "0")
     IAM_ROLE_COUNT=${IAM_ROLE_COUNT//[[:space:]]/}
     IAM_ROLE_COUNT=${IAM_ROLE_COUNT:-0}
 
-    RDS_COUNT=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_rds_instances;" 2>/dev/null || echo "0")
+    RDS_COUNT=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_rds_instances ${CQ_WHERE};" 2>/dev/null || echo "0")
     RDS_COUNT=${RDS_COUNT//[[:space:]]/}
     RDS_COUNT=${RDS_COUNT:-0}
 
-    VPC_COUNT=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_ec2_vpcs;" 2>/dev/null || echo "0")
+    PUBLIC_RDS=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_rds_instances WHERE publicly_accessible = true ${CQ_AND};" 2>/dev/null || echo "0")
+    PUBLIC_RDS=${PUBLIC_RDS//[[:space:]]/}
+    PUBLIC_RDS=${PUBLIC_RDS:-0}
+
+    UNENCRYPTED_RDS=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_rds_instances WHERE storage_encrypted = false ${CQ_AND};" 2>/dev/null || echo "0")
+    UNENCRYPTED_RDS=${UNENCRYPTED_RDS//[[:space:]]/}
+    UNENCRYPTED_RDS=${UNENCRYPTED_RDS:-0}
+
+    VPC_COUNT=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_ec2_vpcs ${CQ_WHERE};" 2>/dev/null || echo "0")
     VPC_COUNT=${VPC_COUNT//[[:space:]]/}
     VPC_COUNT=${VPC_COUNT:-0}
 
@@ -498,8 +592,9 @@ else
     WHERE NOT EXISTS (
       SELECT 1 FROM aws_s3_bucket_server_side_encryption_configuration s 
       WHERE s.bucket_arn = b.arn
-    ) AND (b.server_side_encryption_configuration IS NULL);
-    " 2>/dev/null || docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_s3_buckets WHERE server_side_encryption_configuration IS NULL;" 2>/dev/null || echo "0")
+    ) AND (b.server_side_encryption_configuration IS NULL)
+    ${CQ_AND_B};
+    " 2>/dev/null || docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_s3_buckets WHERE server_side_encryption_configuration IS NULL ${CQ_AND};" 2>/dev/null || echo "0")
     UNENCRYPTED_S3=${UNENCRYPTED_S3//[[:space:]]/}
     UNENCRYPTED_S3=${UNENCRYPTED_S3:-0}
 
@@ -513,8 +608,9 @@ else
         COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int, 0) IN (22, 3389, 5432, 3306)
         OR COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int, 0) IN (22, 3389, 5432, 3306)
         OR perm->>'IpProtocol' = '-1' OR perm->>'ip_protocol' = '-1'
-      );
-    " 2>/dev/null || docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(DISTINCT group_id) FROM aws_ec2_security_group_ip_permissions WHERE cidr_ipv4 = '0.0.0.0/0' AND (from_port IN (22, 3389, 5432, 3306) OR to_port IN (22, 3389, 5432, 3306));" 2>/dev/null || echo "0")
+      )
+      ${CQ_AND_SG};
+    " 2>/dev/null || docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(DISTINCT group_id) FROM aws_ec2_security_group_ip_permissions WHERE cidr_ipv4 = '0.0.0.0/0' AND (from_port IN (22, 3389, 5432, 3306) OR to_port IN (22, 3389, 5432, 3306)) ${CQ_AND};" 2>/dev/null || echo "0")
     OPEN_SG=${OPEN_SG//[[:space:]]/}
     OPEN_SG=${OPEN_SG:-0}
 
@@ -527,14 +623,15 @@ else
         SELECT 1 FROM aws_s3_bucket_server_side_encryption_configuration s 
         WHERE s.bucket_arn = b.arn
       ) AND (b.server_side_encryption_configuration IS NULL)
+      ${CQ_AND_B}
     ) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/unencrypted_s3_buckets.csv" 2>/dev/null || \
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
-    \copy (SELECT account_id, region, name, creation_date FROM aws_s3_buckets WHERE server_side_encryption_configuration IS NULL) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/unencrypted_s3_buckets.csv" 2>/dev/null || true
+    \copy (SELECT account_id, region, name, creation_date FROM aws_s3_buckets WHERE server_side_encryption_configuration IS NULL ${CQ_AND}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/unencrypted_s3_buckets.csv" 2>/dev/null || true
 
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
-    \copy (SELECT account_id, instance_id, instance_type, state_name, private_ip_address, public_ip_address FROM aws_ec2_instances) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/ec2_inventory.csv" 2>/dev/null || \
+    \copy (SELECT account_id, instance_id, instance_type, state_name, private_ip_address, public_ip_address FROM aws_ec2_instances ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/ec2_inventory.csv" 2>/dev/null || \
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
-    \copy (SELECT account_id, instance_id, instance_type, state_name, private_ip_address FROM aws_ec2_instances) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/ec2_inventory.csv" 2>/dev/null || true
+    \copy (SELECT account_id, instance_id, instance_type, state_name, private_ip_address FROM aws_ec2_instances ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/ec2_inventory.csv" 2>/dev/null || true
 
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
     \copy (
@@ -551,17 +648,23 @@ else
           OR COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int, 0) IN (22, 3389, 5432, 3306)
           OR perm->>'IpProtocol' = '-1' OR perm->>'ip_protocol' = '-1'
         )
+        ${CQ_AND_SG}
     ) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/open_security_groups.csv" 2>/dev/null || true
 
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
-    \copy (SELECT account_id, region, db_instance_identifier, db_instance_class, engine, engine_version, db_instance_status FROM aws_rds_instances) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/rds_inventory.csv" 2>/dev/null || true
+    \copy (SELECT account_id, region, db_instance_identifier, db_instance_class, engine, engine_version, db_instance_status FROM aws_rds_instances ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/rds_inventory.csv" 2>/dev/null || true
 
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
-    \copy (SELECT account_id, arn, role_name, create_date FROM aws_iam_roles) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/iam_roles.csv" 2>/dev/null || true
+    \copy (SELECT account_id, region, db_instance_identifier, engine, db_instance_class, COALESCE(endpoint->>'address', endpoint->>'Address', endpoint::text, '') as endpoint, publicly_accessible, storage_encrypted FROM aws_rds_instances WHERE (publicly_accessible = true OR storage_encrypted = false) ${CQ_AND}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/public_rds_instances.csv" 2>/dev/null || \
+    docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
+    \copy (SELECT account_id, region, db_instance_identifier, engine, db_instance_class, publicly_accessible, storage_encrypted FROM aws_rds_instances WHERE (publicly_accessible = true OR storage_encrypted = false) ${CQ_AND}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/public_rds_instances.csv" 2>/dev/null || true
+
+    docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
+    \copy (SELECT account_id, arn, role_name, create_date FROM aws_iam_roles ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/iam_roles.csv" 2>/dev/null || true
 fi
 
 TOTAL_ASSETS=$(( ${EC2_COUNT:-0} + ${S3_COUNT:-0} + ${IAM_ROLE_COUNT:-0} + ${RDS_COUNT:-0} + ${VPC_COUNT:-0} ))
-TOTAL_FINDINGS=$(( ${UNENCRYPTED_S3:-0} + ${OPEN_SG:-0} ))
+TOTAL_FINDINGS=$(( ${UNENCRYPTED_S3:-0} + ${OPEN_SG:-0} + ${PUBLIC_RDS:-0} + ${UNENCRYPTED_RDS:-0} ))
 
 # 6. Generate Self-Contained HTML Report
 if [ "$CLIENT_NAME" = "00-test-mock" ]; then
@@ -786,6 +889,28 @@ cat <<EOF > "${REPORT_DIR}/audit-report.html"
               $([ "$OPEN_SG" -gt 0 ] && echo "Revoke inbound CIDR 0.0.0.0/0 on sensitive ports (22, 3389, 5432, 3306). Restrict ingress to authorized VPN or bastion IPs." || echo "No security groups permit unrestricted public access to critical administration or database ports.")
             </td>
           </tr>
+          <tr>
+            <td><strong>Publicly Accessible RDS Instances</strong><br><small style="color: var(--text-muted);">Database directly exposed to internet</small></td>
+            <td>
+              <span class="badge $([ "${PUBLIC_RDS:-0}" -gt 0 ] && echo 'badge-warn' || echo 'badge-pass')">
+                $([ "${PUBLIC_RDS:-0}" -gt 0 ] && echo "CRITICAL &bull; ${PUBLIC_RDS:-0} Databases" || echo "PASSED (0 Databases)")
+              </span>
+            </td>
+            <td>
+              $([ "${PUBLIC_RDS:-0}" -gt 0 ] && echo "Disable Publicly Accessible flag on RDS instances. Migrate databases to private subnets without public IPs." || echo "No RDS databases are publicly exposed to the internet.")
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Unencrypted RDS Storage</strong><br><small style="color: var(--text-muted);">Storage volume missing encryption at rest</small></td>
+            <td>
+              <span class="badge $([ "${UNENCRYPTED_RDS:-0}" -gt 0 ] && echo 'badge-warn' || echo 'badge-pass')">
+                $([ "${UNENCRYPTED_RDS:-0}" -gt 0 ] && echo "HIGH &bull; ${UNENCRYPTED_RDS:-0} Databases" || echo "PASSED (0 Databases)")
+              </span>
+            </td>
+            <td>
+              $([ "${UNENCRYPTED_RDS:-0}" -gt 0 ] && echo "Enable AWS KMS encryption for RDS storage volumes to protect data at rest." || echo "All discovered RDS database volumes enforce encryption at rest.")
+            </td>
+          </tr>
         </tbody>
       </table>
     </div>
@@ -828,6 +953,13 @@ cat <<EOF > "${REPORT_DIR}/audit-report.html"
           </div>
           <span>📥</span>
         </a>
+        <a class="csv-card" href="public_rds_instances.csv" download>
+          <div>
+            <strong>public_rds_instances.csv</strong><br>
+            <span>Public or unencrypted RDS instances</span>
+          </div>
+          <span>📥</span>
+        </a>
         <a class="csv-card" href="ec2_inventory.csv" download>
           <div>
             <strong>ec2_inventory.csv</strong><br>
@@ -861,10 +993,10 @@ fi
 IMDS_TOKEN=$(curl -s -m 1 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
 EC2_IP=$(curl -s -m 1 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || curl -s -m 2 http://checkip.amazonaws.com 2>/dev/null || echo "13.200.216.63")
 
-python3 - "${CLIENT_NAME}" "${DATE}" "${TIMESTAMP}" "${MOCK_COUNT:-0}" "${EC2_COUNT:-0}" "${S3_COUNT:-0}" "${IAM_ROLE_COUNT:-0}" "${RDS_COUNT:-0}" "${VPC_COUNT:-0}" "${UNENCRYPTED_S3:-0}" "${OPEN_SG:-0}" << 'EOF'
+python3 - "${CLIENT_NAME}" "${DATE}" "${TIMESTAMP}" "${MOCK_COUNT:-0}" "${EC2_COUNT:-0}" "${S3_COUNT:-0}" "${IAM_ROLE_COUNT:-0}" "${RDS_COUNT:-0}" "${VPC_COUNT:-0}" "${UNENCRYPTED_S3:-0}" "${OPEN_SG:-0}" "${PUBLIC_RDS:-0}" "${UNENCRYPTED_RDS:-0}" << 'EOF'
 import sys
 
-client, date, timestamp, mock_c, ec2_c, s3_c, iam_c, rds_c, vpc_c, unenc_s3, open_sg = sys.argv[1:12]
+client, date, timestamp, mock_c, ec2_c, s3_c, iam_c, rds_c, vpc_c, unenc_s3, open_sg, pub_rds, unenc_rds = sys.argv[1:14]
 
 W = 75
 top = "╔" + "═" * (W - 2) + "╗"
@@ -903,16 +1035,22 @@ else:
     print("║" + " SECURITY HIGHLIGHTS:".ljust(W - 2) + "║")
     u_s3 = int(unenc_s3) if unenc_s3.isdigit() else 0
     o_sg = int(open_sg) if open_sg.isdigit() else 0
+    p_rds = int(pub_rds) if pub_rds.isdigit() else 0
+    u_rds = int(unenc_rds) if unenc_rds.isdigit() else 0
     s3_status = "[WARN]" if u_s3 > 0 else "[PASS]"
     sg_status = "[WARN]" if o_sg > 0 else "[PASS]"
+    p_rds_status = "[CRIT]" if p_rds > 0 else "[PASS]"
+    u_rds_status = "[WARN]" if u_rds > 0 else "[PASS]"
     print("║" + f"   {s3_status} Unencrypted S3 Buckets:      {u_s3}".ljust(W - 2) + "║")
     print("║" + f"   {sg_status} Open Security Groups:        {o_sg}".ljust(W - 2) + "║")
+    print("║" + f"   {p_rds_status} Publicly Accessible RDS:     {p_rds}".ljust(W - 2) + "║")
+    print("║" + f"   {u_rds_status} Unencrypted RDS Storage:       {u_rds}".ljust(W - 2) + "║")
 print(bot)
 EOF
 
 if [ "$CLIENT_NAME" != "00-test-mock" ]; then
-    if [ "$UNENCRYPTED_S3" -gt 0 ] || [ "$OPEN_SG" -gt 0 ]; then
-        echo -e "\n\033[1;33m[SECURITY ALERT]\033[0m Findings detected! Review open_security_groups.csv and unencrypted_s3_buckets.csv"
+    if [ "$TOTAL_FINDINGS" -gt 0 ]; then
+        echo -e "\n\033[1;33m[SECURITY ALERT]\033[0m Findings detected! Review CSV exports in ${REPORT_DIR}"
     else
         echo -e "\n\033[1;32m[SECURITY AUDIT PASSED]\033[0m All baseline checks passed cleanly."
     fi
@@ -934,6 +1072,7 @@ Reports generated at: ${REPORT_DIR}
   • audit-report.html          (Styled Executive Report)
   • unencrypted_s3_buckets.csv (CSV finding list)
   • open_security_groups.csv   (Exposed Security Groups finding list)
+  • public_rds_instances.csv   (Public or unencrypted RDS instances)
   • ec2_inventory.csv          (Complete asset list)
   • rds_inventory.csv          (RDS database list)
   • iam_roles.csv              (IAM roles list)
@@ -957,6 +1096,7 @@ Reports generated at: ${REPORT_DIR}
   • audit-report.html          (Styled Executive Report)
   • unencrypted_s3_buckets.csv (CSV finding list)
   • open_security_groups.csv   (Exposed Security Groups finding list)
+  • public_rds_instances.csv   (Public or unencrypted RDS instances)
   • ec2_inventory.csv          (Complete asset list)
   • rds_inventory.csv          (RDS database list)
   • iam_roles.csv              (IAM roles list)

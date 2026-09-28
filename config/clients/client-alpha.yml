@@ -1,3 +1,4 @@
+# This configuration file defines a source for CloudQuery to extract data from AWS services.
 kind: source
 spec:
   name: aws-client-alpha

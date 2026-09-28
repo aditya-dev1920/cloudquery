@@ -1,3 +1,4 @@
+# This configuration file defines a destination for CloudQuery to write data to a PostgreSQL database. It specifies the connection string, write mode, and other relevant settings for the destination.
 kind: destination
 spec:
   name: postgresql

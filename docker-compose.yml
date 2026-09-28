@@ -1,5 +1,6 @@
 version: '3.8'
 
+# This docker-compose file is used to run a dedicated PostgreSQL database for CloudQuery.
 services:
   postgres:
     image: postgres:16-alpine
@@ -21,9 +22,11 @@ services:
     networks:
       - cq_isolated_network
 
+# This network is used to isolate the PostgreSQL service from other services in the docker-compose environment.
 networks:
   cq_isolated_network:
     driver: bridge
 
+# This volume is used to persist PostgreSQL data across container restarts and recreations.
 volumes:
   cq_dedicated_pgdata:

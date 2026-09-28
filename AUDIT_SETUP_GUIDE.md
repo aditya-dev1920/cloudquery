@@ -16,6 +16,7 @@ Menu options:
 * `[2] 01-aws-internal.yml` — Audits this server's own AWS account (all enabled regions).
 * `[3] client-alpha.yml` — Cross-account audit of an external client's AWS account.
 * `[A] Scan All Clients` — Runs batch scans across all configured client profiles.
+* `[C] Onboard New Client (Interactive Wizard)` — Step-by-step wizard to add client Account ID, Role ARN, and External ID.
 * `[D] Download / View Past Reports` — Browse and package previously generated audit reports into a single ZIP for easy download.
 
 ### 2. Non-Interactive / Automated Scans (Cron)
@@ -46,6 +47,7 @@ scp -i <YOUR_KEY.pem> -r ubuntu@13.200.216.63:/home/ubuntu/cloudquery/reports/$(
 * `audit-report.html` — Clean, executive visual dashboard with inventory counts and risk badges.
 * `open_security_groups.csv` — Security groups exposing dangerous ports (22, 3389, 5432, 3306) to `0.0.0.0/0`.
 * `unencrypted_s3_buckets.csv` — S3 buckets missing Server-Side Encryption (SSE).
+* `public_rds_instances.csv` — Publicly accessible or unencrypted RDS database instances with endpoints and engines.
 * `ec2_inventory.csv` — Complete list of EC2 compute instances, types, states, and private IPs.
 * `rds_inventory.csv` — Complete list of RDS database instances and engines.
 * `iam_roles.csv` — Complete list of IAM roles and creation dates.

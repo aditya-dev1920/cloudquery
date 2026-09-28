@@ -1,8 +1,11 @@
+# Git Ignore File for CloudQuery
 .DS_store
 crash.log
 .idea
 .vscode
 cover.out
+
+# Ignore CloudQuery Build Artifacts
 cloudquery
 cloudquery.db
 cloudquery.zip
@@ -14,7 +17,11 @@ bin/
 .terraform*
 *.log
 .cq
+
+# Ignore Environment Files
 .env
+
+# Ignore Database Data and Output Files
 database-data/*
 dest/*
 outfile
@@ -22,24 +29,37 @@ cli/examples
 cli/cq_csv_output
 test_init_config.yml
 telemetry-random-id
+
+# Ignore Go Work Files
 go.work
 go.work.sum
 go.work.backup
 go.work.sum.backup
+
+# Ignore CLI and Debug Binaries
 cli/examples
 cli/cli
 __tables.json
 !cloud-config-ui/src/data/__tables.json
+
+# Ignore Debug Binaries
 __debug_bin
 .vercel
+
+# Ignore Python Virtual Environment and Cache
 venv
 __pycache__
 cli/cloudquery-sync-summary.json
 __debug_bin*
+
+# Ignore Coverage Files
 coverage.out.tmp
 coverage.out
 
 # Runtime Reports and Large Binary Caches
 reports/
 logs/
-cache/cq-source-aws
+cache/*
+!cache/*.yaml
+!cache/*.yml
+!cache/*.md
