@@ -40,16 +40,19 @@ Audit reports are generated under `reports/<YYYY-MM-DD>/<CLIENT_NAME>/`.
 
 To download the **complete audit bundle** (HTML dashboard + all CSV finding lists):
 ```bash
-scp -i <YOUR_KEY.pem> -r ubuntu@13.200.216.63:/home/ubuntu/cloudquery/reports/$(date +%Y-%m-%d)/01-aws-internal ./
+# Replace <SERVER_IP> with your EC2 public IP or private IP (e.g. 13.200.216.63)
+scp -i <YOUR_KEY.pem> -r ubuntu@<SERVER_IP>:/home/ubuntu/cloudquery/reports/$(date +%Y-%m-%d)/01-aws-internal ./
 ```
 
 ### Generated Report Deliverables:
-* `audit-report.html` — Clean, executive visual dashboard with inventory counts and risk badges.
-* `open_security_groups.csv` — Security groups exposing dangerous ports (22, 3389, 5432, 3306) to `0.0.0.0/0`.
-* `unencrypted_s3_buckets.csv` — S3 buckets missing Server-Side Encryption (SSE).
+* `audit-report.html` — Clean, executive visual dashboard with inventory counts, risk badges, and direct CSV links.
+* `public_s3_buckets.csv` — S3 buckets missing AWS Block Public Access settings.
+* `open_security_groups.csv` — Security groups exposing dangerous ports (22, 3389, 5432, 3306) or all traffic to `0.0.0.0/0` or `::/0`.
 * `public_rds_instances.csv` — Publicly accessible or unencrypted RDS database instances with endpoints and engines.
-* `ec2_inventory.csv` — Complete list of EC2 compute instances, types, states, and private IPs.
-* `rds_inventory.csv` — Complete list of RDS database instances and engines.
+* `ec2_inventory.csv` — Complete list of EC2 compute instances, types, states, and private/public IPs.
+* `s3_inventory.csv` — Complete inventory of all discovered S3 storage buckets.
+* `rds_inventory.csv` — Complete list of RDS database instances, status, and engines.
+* `vpc_inventory.csv` — Complete list of VPC networks, CIDR blocks, and default flags.
 * `iam_roles.csv` — Complete list of IAM roles and creation dates.
 
 ---
@@ -176,19 +179,19 @@ When running scans on the remote EC2 server, you have two ways to get reports on
 
 ### Method 1: 1-Click Browser Download Link (No PEM / No SSH Required!)
 When bundling a report (or selecting `[D]` for past reports), select **Option 2 (Web Download)**:
-* It temporarily starts a lightweight Python download server on port 8080.
+* It temporarily starts a lightweight Python download server on the first available port (8080–8090).
 * Open the displayed link in your laptop's browser:
-  `http://13.200.216.63:8080/audit-bundle-....zip`
+  `http://<SERVER_IP>:8080/audit-bundle-....zip`
 * Click to download the ZIP file directly.
 * Press Enter in your terminal to shut down the web server when done.
 
 ### Method 2: SCP Command (For users with SSH access)
 ```bash
 # With PEM key:
-scp -i <YOUR_KEY.pem> ubuntu@13.200.216.63:/home/ubuntu/cloudquery/reports/<DATE>/<CLIENT>/audit-bundle-...zip ./
+scp -i <YOUR_KEY.pem> ubuntu@<SERVER_IP>:/home/ubuntu/cloudquery/reports/<DATE>/<CLIENT>/audit-bundle-...zip ./
 
 # Without PEM key (Password or default ~/.ssh key):
-scp ubuntu@13.200.216.63:/home/ubuntu/cloudquery/reports/<DATE>/<CLIENT>/audit-bundle-...zip ./
+scp ubuntu@<SERVER_IP>:/home/ubuntu/cloudquery/reports/<DATE>/<CLIENT>/audit-bundle-...zip ./
 ```
 
 ---
@@ -200,14 +203,25 @@ All crawled AWS data is preserved in PostgreSQL on port `5435`:
 docker exec -it cq-postgres-engine psql -U cq_admin -d cloudquery
 ```
 
-Example queries:
+Example verified queries:
 ```sql
 -- View all discovered tables
 \dt aws_*
 
--- List unencrypted S3 buckets
-SELECT account_id, region, name FROM aws_s3_buckets WHERE server_side_encryption_configuration IS NULL;
+-- List publicly exposed S3 buckets (missing Block Public Access)
+SELECT account_id, region, name, creation_date 
+FROM aws_s3_buckets 
+WHERE (block_public_acls = false OR block_public_policy = false OR ignore_public_acls = false OR restrict_public_buckets = false);
 
 -- List EC2 instances running
-SELECT instance_id, instance_type, state_name FROM aws_ec2_instances WHERE state_name = 'running';
+SELECT instance_id, instance_type, COALESCE(state->>'Name', state->>'name', state::text, '') as state, private_ip_address, public_ip_address 
+FROM aws_ec2_instances 
+WHERE COALESCE(state->>'Name', state->>'name', state::text, '') = 'running';
+
+-- List security groups exposing ports to 0.0.0.0/0 or ::/0
+SELECT DISTINCT sg.group_id, sg.group_name 
+FROM aws_ec2_security_groups sg, 
+     jsonb_array_elements(COALESCE(sg.ip_permissions, '[]'::jsonb)) perm, 
+     jsonb_array_elements(COALESCE(perm->'IpRanges', perm->'ip_ranges', perm->'Ipv6Ranges', perm->'ipv6_ranges', '[]'::jsonb)) r 
+WHERE r->>'CidrIp' = '0.0.0.0/0' OR r->>'cidr_ip' = '0.0.0.0/0' OR r->>'CidrIpv6' = '::/0' OR r->>'cidr_ipv6' = '::/0';
 ```

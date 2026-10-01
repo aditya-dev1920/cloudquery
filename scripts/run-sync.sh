@@ -31,12 +31,21 @@ export CQ_PG_CONNECTION_STRING="${CQ_PG_CONNECTION_STRING:-postgresql://cq_admin
 if ! docker ps --format '{{.Names}}' | grep -q "^cq-postgres-engine$"; then
     echo -e "\033[1;33m[WARN]\033[0m PostgreSQL container 'cq-postgres-engine' is not running. Starting engine..."
     docker compose -f "${APP_DIR}/docker-compose.yml" up -d
-    for _ in {1..15}; do
-        if docker exec -i cq-postgres-engine pg_isready -U cq_admin -d cloudquery >/dev/null 2>&1; then
-            break
-        fi
-        sleep 1
-    done
+fi
+
+# Ensure PostgreSQL engine is actively accepting connections
+PG_READY=false
+for _ in {1..15}; do
+    if docker exec -i cq-postgres-engine pg_isready -U cq_admin -d cloudquery >/dev/null 2>&1; then
+        PG_READY=true
+        break
+    fi
+    sleep 1
+done
+
+if [ "$PG_READY" != true ]; then
+    echo -e "\033[1;31m[ERROR]\033[0m PostgreSQL engine 'cq-postgres-engine' is not ready."
+    exit 1
 fi
 
 # Verify CLI binary exists (auto-compile if missing)
@@ -96,17 +105,50 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
     fi
 }
 
+# Helper: Detect host IP dynamically (EC2 public IP -> local interface IP -> localhost)
+detect_host_ip() {
+    local detected_ip=""
+    local token=""
+    token=$(curl -s -m 1 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+    if [ -n "$token" ]; then
+        detected_ip=$(curl -s -m 1 -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)
+        if [ -z "$detected_ip" ]; then
+            detected_ip=$(curl -s -m 1 -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || true)
+        fi
+    fi
+    if [ -z "$detected_ip" ]; then
+        detected_ip=$(curl -s -m 2 http://checkip.amazonaws.com 2>/dev/null || true)
+    fi
+    if [ -z "$detected_ip" ]; then
+        detected_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    echo "${detected_ip:-127.0.0.1}"
+}
+
 # Helper: Serve report directory via temporary HTTP server for 1-click browser download (No PEM/SSH needed)
 serve_download_http() {
     local SERVE_DIR="$1"
     local ZIP_NAME="$2"
     local PORT="${3:-8080}"
-    local TARGET_IP="${HOST_IP:-${EC2_IP:-13.200.216.63}}"
+    local TARGET_IP="${HOST_IP:-${EC2_IP:-$(detect_host_ip)}}"
     
-    # Auto-fallback if port 8080 is already occupied
-    if ss -tuln 2>/dev/null | grep -q ":${PORT} "; then
-        PORT=8081
-    fi
+    # Auto-fallback to next available port in 8080-8090 if already occupied
+    is_port_in_use() {
+        local check_p="$1"
+        if command -v python3 >/dev/null 2>&1; then
+            ! python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(('', int($check_p))); s.close()" 2>/dev/null
+        else
+            ss -tuln 2>/dev/null | grep -q ":${check_p} "
+        fi
+    }
+
+    while is_port_in_use "$PORT"; do
+        PORT=$((PORT + 1))
+        if [ "$PORT" -gt 8090 ]; then
+            echo -e "\033[1;31m[ERROR]\033[0m All ports in range 8080-8090 are occupied."
+            return 1
+        fi
+    done
     
     echo ""
     echo "====================================================================="
@@ -189,9 +231,9 @@ handle_download_menu() {
             package_audit_zip "${SELECTED_DIR}" "$(basename "$ZIP_OUT")"
             
             IMDS_TOKEN=$(curl -s -m 1 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
-            HOST_IP=$(curl -s -m 1 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || curl -s -m 2 http://checkip.amazonaws.com 2>/dev/null || echo "13.200.216.63")
+            HOST_IP=$(detect_host_ip)
             
-            if [ -n "$IMDS_TOKEN" ] && [ "$HOST_IP" != "127.0.0.1" ] && [ "$HOST_IP" != "localhost" ]; then
+            if [ -n "$IMDS_TOKEN" ] || [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || ([ "$HOST_IP" != "127.0.0.1" ] && [ "$HOST_IP" != "localhost" ]); then
                 echo -e "\n\033[1;32m[SUCCESS]\033[0m Report bundle ready: $(basename "$ZIP_OUT")"
                 echo ""
                 echo "Choose download method:"
@@ -616,13 +658,35 @@ else
     SELECT count(DISTINCT sg.group_id)
     FROM aws_ec2_security_groups sg,
          jsonb_array_elements(COALESCE(sg.ip_permissions, '[]'::jsonb)) AS perm
-    LEFT JOIN jsonb_array_elements(COALESCE(perm->'IpRanges', perm->'ip_ranges', '[]'::jsonb)) AS ip_range ON true
-    WHERE (ip_range->>'CidrIp' = '0.0.0.0/0' OR ip_range->>'cidr_ip' = '0.0.0.0/0')
+    WHERE (
+            perm->>'IpProtocol' IN ('-1', 'all') OR perm->>'ip_protocol' IN ('-1', 'all')
+            OR (
+              COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int, 0) <= 22
+              AND COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int, 65535) >= 22
+            )
+            OR (
+              COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int, 0) <= 3389
+              AND COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int, 65535) >= 3389
+            )
+            OR (
+              COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int, 0) <= 5432
+              AND COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int, 65535) >= 5432
+            )
+            OR (
+              COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int, 0) <= 3306
+              AND COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int, 65535) >= 3306
+            )
+          )
       AND (
-        COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int, 0) IN (22, 3389, 5432, 3306)
-        OR COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int, 0) IN (22, 3389, 5432, 3306)
-        OR perm->>'IpProtocol' = '-1' OR perm->>'ip_protocol' = '-1'
-      )
+            EXISTS (
+              SELECT 1 FROM jsonb_array_elements(COALESCE(perm->'IpRanges', perm->'ip_ranges', '[]'::jsonb)) r
+              WHERE r->>'CidrIp' = '0.0.0.0/0' OR r->>'cidr_ip' = '0.0.0.0/0'
+            )
+            OR EXISTS (
+              SELECT 1 FROM jsonb_array_elements(COALESCE(perm->'Ipv6Ranges', perm->'ipv6_ranges', '[]'::jsonb)) r
+              WHERE r->>'CidrIpv6' = '::/0' OR r->>'cidr_ipv6' = '::/0'
+            )
+          )
       ${CQ_AND_SG};
     " 2>/dev/null || echo "0")
     OPEN_SG=${OPEN_SG//[[:space:]]/}
@@ -639,25 +703,47 @@ else
     ) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/public_s3_buckets.csv" 2>/dev/null || true
 
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
-    \copy (SELECT account_id, instance_id, instance_type, COALESCE(state->>'Name', state->>'name', state::text, '') as state, private_ip_address, public_ip_address FROM aws_ec2_instances ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/ec2_inventory.csv" 2>/dev/null || \
+    \copy (SELECT account_id, region, instance_id, instance_type, COALESCE(state->>'Name', state->>'name', state::text, '') as state, private_ip_address, public_ip_address FROM aws_ec2_instances ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/ec2_inventory.csv" 2>/dev/null || \
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
-    \copy (SELECT account_id, instance_id, instance_type, COALESCE(state->>'Name', state->>'name', state::text, '') as state, private_ip_address FROM aws_ec2_instances ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/ec2_inventory.csv" 2>/dev/null || true
+    \copy (SELECT account_id, region, instance_id, instance_type, COALESCE(state->>'Name', state->>'name', state::text, '') as state, private_ip_address FROM aws_ec2_instances ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/ec2_inventory.csv" 2>/dev/null || true
 
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
     \copy (
       SELECT DISTINCT sg.account_id, sg.region, sg.group_id, sg.group_name, 
              COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int) as from_port, 
              COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int) as to_port, 
-             COALESCE(perm->>'IpProtocol', perm->>'ip_protocol') as protocol
+             COALESCE(perm->>'IpProtocol', perm->>'ip_protocol') as protocol,
+             ranges.cidr as exposed_cidr
       FROM aws_ec2_security_groups sg,
-           jsonb_array_elements(COALESCE(sg.ip_permissions, '[]'::jsonb)) AS perm
-      LEFT JOIN jsonb_array_elements(COALESCE(perm->'IpRanges', perm->'ip_ranges', '[]'::jsonb)) AS ip_range ON true
-      WHERE (ip_range->>'CidrIp' = '0.0.0.0/0' OR ip_range->>'cidr_ip' = '0.0.0.0/0')
-        AND (
-          COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int, 0) IN (22, 3389, 5432, 3306)
-          OR COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int, 0) IN (22, 3389, 5432, 3306)
-          OR perm->>'IpProtocol' = '-1' OR perm->>'ip_protocol' = '-1'
-        )
+           jsonb_array_elements(COALESCE(sg.ip_permissions, '[]'::jsonb)) AS perm,
+           LATERAL (
+             SELECT COALESCE(r->>'CidrIp', r->>'cidr_ip') as cidr
+             FROM jsonb_array_elements(COALESCE(perm->'IpRanges', perm->'ip_ranges', '[]'::jsonb)) r
+             WHERE r->>'CidrIp' = '0.0.0.0/0' OR r->>'cidr_ip' = '0.0.0.0/0'
+             UNION ALL
+             SELECT COALESCE(r->>'CidrIpv6', r->>'cidr_ipv6') as cidr
+             FROM jsonb_array_elements(COALESCE(perm->'Ipv6Ranges', perm->'ipv6_ranges', '[]'::jsonb)) r
+             WHERE r->>'CidrIpv6' = '::/0' OR r->>'cidr_ipv6' = '::/0'
+           ) ranges
+      WHERE (
+              perm->>'IpProtocol' IN ('-1', 'all') OR perm->>'ip_protocol' IN ('-1', 'all')
+              OR (
+                COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int, 0) <= 22
+                AND COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int, 65535) >= 22
+              )
+              OR (
+                COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int, 0) <= 3389
+                AND COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int, 65535) >= 3389
+              )
+              OR (
+                COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int, 0) <= 5432
+                AND COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int, 65535) >= 5432
+              )
+              OR (
+                COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int, 0) <= 3306
+                AND COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int, 65535) >= 3306
+              )
+            )
         ${CQ_AND_SG}
     ) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/open_security_groups.csv" 2>/dev/null || true
 
@@ -671,6 +757,12 @@ else
 
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
     \copy (SELECT account_id, arn, role_name, create_date FROM aws_iam_roles ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/iam_roles.csv" 2>/dev/null || true
+
+    docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
+    \copy (SELECT account_id, region, name, creation_date FROM aws_s3_buckets ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/s3_inventory.csv" 2>/dev/null || true
+
+    docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
+    \copy (SELECT account_id, region, vpc_id, cidr_block, is_default, state FROM aws_ec2_vpcs ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/vpc_inventory.csv" 2>/dev/null || true
 fi
 
 TOTAL_ASSETS=$(( ${EC2_COUNT:-0} + ${S3_COUNT:-0} + ${IAM_ROLE_COUNT:-0} + ${RDS_COUNT:-0} + ${VPC_COUNT:-0} ))
@@ -991,6 +1083,20 @@ cat <<EOF > "${REPORT_DIR}/audit-report.html"
           </div>
           <span>📥</span>
         </a>
+        <a class="csv-card" href="s3_inventory.csv" download>
+          <div>
+            <strong>s3_inventory.csv</strong><br>
+            <span>Complete S3 bucket inventory</span>
+          </div>
+          <span>📥</span>
+        </a>
+        <a class="csv-card" href="vpc_inventory.csv" download>
+          <div>
+            <strong>vpc_inventory.csv</strong><br>
+            <span>VPC network topologies & CIDRs</span>
+          </div>
+          <span>📥</span>
+        </a>
       </div>
     </div>
   </div>
@@ -1006,7 +1112,7 @@ package_audit_zip "${REPORT_DIR}" "${ZIP_FILE_NAME}"
 
 # 7. Print Terminal Summary Dashboard
 IMDS_TOKEN=$(curl -s -m 1 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
-EC2_IP=$(curl -s -m 1 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || curl -s -m 2 http://checkip.amazonaws.com 2>/dev/null || echo "13.200.216.63")
+EC2_IP=$(detect_host_ip)
 
 python3 - "${CLIENT_NAME}" "${DATE}" "${TIMESTAMP}" "${MOCK_COUNT:-0}" "${EC2_COUNT:-0}" "${S3_COUNT:-0}" "${IAM_ROLE_COUNT:-0}" "${RDS_COUNT:-0}" "${VPC_COUNT:-0}" "${PUBLIC_S3:-0}" "${OPEN_SG:-0}" "${PUBLIC_RDS:-0}" "${UNENCRYPTED_RDS:-0}" << 'EOF'
 import sys
@@ -1073,7 +1179,7 @@ fi
 
 # Detect environment (EC2 vs Local)
 IS_EC2=false
-if [ -n "$IMDS_TOKEN" ] && [ "$EC2_IP" != "127.0.0.1" ] && [ "$EC2_IP" != "localhost" ]; then
+if [ -n "$IMDS_TOKEN" ] || [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_CLIENT" ] || ([ "$EC2_IP" != "127.0.0.1" ] && [ "$EC2_IP" != "localhost" ]); then
     IS_EC2=true
 fi
 
@@ -1089,7 +1195,9 @@ Reports generated at: ${REPORT_DIR}
   • open_security_groups.csv   (Exposed Security Groups finding list)
   • public_rds_instances.csv   (Public or unencrypted RDS instances)
   • ec2_inventory.csv          (Complete asset list)
+  • s3_inventory.csv           (Complete S3 bucket inventory)
   • rds_inventory.csv          (RDS database list)
+  • vpc_inventory.csv          (VPC network inventory)
   • iam_roles.csv              (IAM roles list)
 
 Run on your laptop's terminal to download:
@@ -1113,7 +1221,9 @@ Reports generated at: ${REPORT_DIR}
   • open_security_groups.csv   (Exposed Security Groups finding list)
   • public_rds_instances.csv   (Public or unencrypted RDS instances)
   • ec2_inventory.csv          (Complete asset list)
+  • s3_inventory.csv           (Complete S3 bucket inventory)
   • rds_inventory.csv          (RDS database list)
+  • vpc_inventory.csv          (VPC network inventory)
   • iam_roles.csv              (IAM roles list)
 
 Open the report directly in your browser:
