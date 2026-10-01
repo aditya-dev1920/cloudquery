@@ -74,7 +74,28 @@ if [ -d "${APP_DIR}/cache/plugins" ] && [ ! -w "${APP_DIR}/cache/plugins" ]; the
 fi
 mkdir -p "${APP_DIR}/cache"
 
-# Helper: Serve report directory via temporary HTTP server for 1-click browser download (No PEM/SSH needed)
+# Helper: Safely package audit directory into ZIP bundle (excluding existing .zip files)
+package_audit_zip() {
+    local TARGET_DIR="$1"
+    local ZIP_NAME="$2"
+    local ZIP_PATH="${TARGET_DIR}/${ZIP_NAME}"
+
+    rm -f "$ZIP_PATH" 2>/dev/null || true
+    if command -v zip >/dev/null 2>&1; then
+        (cd "$TARGET_DIR" && { zip -q "$ZIP_NAME" audit-report.html *.csv 2>/dev/null || zip -r -q "$ZIP_NAME" . -x "*.zip"; })
+    else
+        python3 -c "
+import zipfile, glob, os
+target_dir = r'''$TARGET_DIR'''
+zip_path = r'''$ZIP_PATH'''
+with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+    for f in sorted(glob.glob(os.path.join(target_dir, '*'))):
+        if not f.endswith('.zip') and os.path.isfile(f):
+            z.write(f, os.path.basename(f))
+" 2>/dev/null || true
+    fi
+}
+
 # Helper: Serve report directory via temporary HTTP server for 1-click browser download (No PEM/SSH needed)
 serve_download_http() {
     local SERVE_DIR="$1"
@@ -165,11 +186,7 @@ handle_download_menu() {
         
         if [[ "$DO_BUNDLE" =~ ^[Yy]$ ]]; then
             ZIP_OUT="${SELECTED_DIR}/audit-bundle-${SEL_CLIENT}-${SEL_DATE}.zip"
-            if command -v zip >/dev/null 2>&1; then
-                (cd "$(dirname "$SELECTED_DIR")" && zip -r -q "$ZIP_OUT" "$(basename "$SELECTED_DIR")")
-            else
-                (cd "$(dirname "$SELECTED_DIR")" && python3 -m zipfile -c "$ZIP_OUT" "$(basename "$SELECTED_DIR")")
-            fi
+            package_audit_zip "${SELECTED_DIR}" "$(basename "$ZIP_OUT")"
             
             IMDS_TOKEN=$(curl -s -m 1 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
             HOST_IP=$(curl -s -m 1 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || curl -s -m 2 http://checkip.amazonaws.com 2>/dev/null || echo "13.200.216.63")
@@ -587,19 +604,16 @@ else
     VPC_COUNT=${VPC_COUNT//[[:space:]]/}
     VPC_COUNT=${VPC_COUNT:-0}
 
-    UNENCRYPTED_S3=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "
-    SELECT count(*) FROM aws_s3_buckets b
-    WHERE NOT EXISTS (
-      SELECT 1 FROM aws_s3_bucket_server_side_encryption_configuration s 
-      WHERE s.bucket_arn = b.arn
-    ) AND (b.server_side_encryption_configuration IS NULL)
-    ${CQ_AND_B};
-    " 2>/dev/null || docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(*) FROM aws_s3_buckets WHERE server_side_encryption_configuration IS NULL ${CQ_AND};" 2>/dev/null || echo "0")
-    UNENCRYPTED_S3=${UNENCRYPTED_S3//[[:space:]]/}
-    UNENCRYPTED_S3=${UNENCRYPTED_S3:-0}
+    PUBLIC_S3=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "
+    SELECT count(*) FROM aws_s3_buckets
+    WHERE (block_public_acls = false OR block_public_policy = false OR ignore_public_acls = false OR restrict_public_buckets = false)
+    ${CQ_AND};
+    " 2>/dev/null || echo "0")
+    PUBLIC_S3=${PUBLIC_S3//[[:space:]]/}
+    PUBLIC_S3=${PUBLIC_S3:-0}
 
     OPEN_SG=$(docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "
-    SELECT count(DISTINCT sg.id)
+    SELECT count(DISTINCT sg.group_id)
     FROM aws_ec2_security_groups sg,
          jsonb_array_elements(COALESCE(sg.ip_permissions, '[]'::jsonb)) AS perm
     LEFT JOIN jsonb_array_elements(COALESCE(perm->'IpRanges', perm->'ip_ranges', '[]'::jsonb)) AS ip_range ON true
@@ -610,32 +624,28 @@ else
         OR perm->>'IpProtocol' = '-1' OR perm->>'ip_protocol' = '-1'
       )
       ${CQ_AND_SG};
-    " 2>/dev/null || docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -t -c "SELECT count(DISTINCT group_id) FROM aws_ec2_security_group_ip_permissions WHERE cidr_ipv4 = '0.0.0.0/0' AND (from_port IN (22, 3389, 5432, 3306) OR to_port IN (22, 3389, 5432, 3306)) ${CQ_AND};" 2>/dev/null || echo "0")
+    " 2>/dev/null || echo "0")
     OPEN_SG=${OPEN_SG//[[:space:]]/}
     OPEN_SG=${OPEN_SG:-0}
 
     # 5. Export CSV Finding Files (Live AWS scans only)
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
     \copy (
-      SELECT b.account_id, b.region, b.name, b.creation_date 
-      FROM aws_s3_buckets b 
-      WHERE NOT EXISTS (
-        SELECT 1 FROM aws_s3_bucket_server_side_encryption_configuration s 
-        WHERE s.bucket_arn = b.arn
-      ) AND (b.server_side_encryption_configuration IS NULL)
-      ${CQ_AND_B}
-    ) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/unencrypted_s3_buckets.csv" 2>/dev/null || \
-    docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
-    \copy (SELECT account_id, region, name, creation_date FROM aws_s3_buckets WHERE server_side_encryption_configuration IS NULL ${CQ_AND}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/unencrypted_s3_buckets.csv" 2>/dev/null || true
+      SELECT account_id, region, name, creation_date,
+             block_public_acls, block_public_policy, ignore_public_acls, restrict_public_buckets
+      FROM aws_s3_buckets
+      WHERE (block_public_acls = false OR block_public_policy = false OR ignore_public_acls = false OR restrict_public_buckets = false)
+      ${CQ_AND}
+    ) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/public_s3_buckets.csv" 2>/dev/null || true
 
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
-    \copy (SELECT account_id, instance_id, instance_type, state_name, private_ip_address, public_ip_address FROM aws_ec2_instances ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/ec2_inventory.csv" 2>/dev/null || \
+    \copy (SELECT account_id, instance_id, instance_type, COALESCE(state->>'Name', state->>'name', state::text, '') as state, private_ip_address, public_ip_address FROM aws_ec2_instances ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/ec2_inventory.csv" 2>/dev/null || \
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
-    \copy (SELECT account_id, instance_id, instance_type, state_name, private_ip_address FROM aws_ec2_instances ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/ec2_inventory.csv" 2>/dev/null || true
+    \copy (SELECT account_id, instance_id, instance_type, COALESCE(state->>'Name', state->>'name', state::text, '') as state, private_ip_address FROM aws_ec2_instances ${CQ_WHERE}) TO STDOUT WITH CSV HEADER" > "${REPORT_DIR}/ec2_inventory.csv" 2>/dev/null || true
 
     docker exec -i cq-postgres-engine psql -U cq_admin -d cloudquery -c "
     \copy (
-      SELECT DISTINCT sg.account_id, sg.region, COALESCE(sg.group_id, sg.id) as group_id, sg.group_name, 
+      SELECT DISTINCT sg.account_id, sg.region, sg.group_id, sg.group_name, 
              COALESCE((perm->>'FromPort')::int, (perm->>'from_port')::int) as from_port, 
              COALESCE((perm->>'ToPort')::int, (perm->>'to_port')::int) as to_port, 
              COALESCE(perm->>'IpProtocol', perm->>'ip_protocol') as protocol
@@ -664,7 +674,7 @@ else
 fi
 
 TOTAL_ASSETS=$(( ${EC2_COUNT:-0} + ${S3_COUNT:-0} + ${IAM_ROLE_COUNT:-0} + ${RDS_COUNT:-0} + ${VPC_COUNT:-0} ))
-TOTAL_FINDINGS=$(( ${UNENCRYPTED_S3:-0} + ${OPEN_SG:-0} + ${PUBLIC_RDS:-0} + ${UNENCRYPTED_RDS:-0} ))
+TOTAL_FINDINGS=$(( ${PUBLIC_S3:-0} + ${OPEN_SG:-0} + ${PUBLIC_RDS:-0} + ${UNENCRYPTED_RDS:-0} ))
 
 # 6. Generate Self-Contained HTML Report
 if [ "$CLIENT_NAME" = "00-test-mock" ]; then
@@ -868,14 +878,14 @@ cat <<EOF > "${REPORT_DIR}/audit-report.html"
         </thead>
         <tbody>
           <tr>
-            <td><strong>Unencrypted S3 Buckets</strong></td>
+            <td><strong>Publicly Exposed S3 Buckets</strong><br><small style="color: var(--text-muted);">Missing S3 Block Public Access</small></td>
             <td>
-              <span class="badge $([ "$UNENCRYPTED_S3" -gt 0 ] && echo 'badge-warn' || echo 'badge-pass')">
-                $([ "$UNENCRYPTED_S3" -gt 0 ] && echo "HIGH &bull; ${UNENCRYPTED_S3} Buckets" || echo "PASSED (0 Buckets)")
+              <span class="badge $([ "${PUBLIC_S3:-0}" -gt 0 ] && echo 'badge-warn' || echo 'badge-pass')">
+                $([ "${PUBLIC_S3:-0}" -gt 0 ] && echo "HIGH &bull; ${PUBLIC_S3:-0} Buckets" || echo "PASSED (0 Buckets)")
               </span>
             </td>
             <td>
-              $([ "$UNENCRYPTED_S3" -gt 0 ] && echo "Enable Amazon S3 Default Bucket Encryption (AES-256 or AWS-KMS SSE-KMS) to protect stored data at rest." || echo "All discovered S3 buckets enforce default server-side encryption.")
+              $([ "${PUBLIC_S3:-0}" -gt 0 ] && echo "Enable S3 Block Public Access (BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy, RestrictPublicBuckets) to prevent unintentional public exposure." || echo "All discovered S3 buckets enforce comprehensive Block Public Access settings.")
             </td>
           </tr>
           <tr>
@@ -946,10 +956,10 @@ cat <<EOF > "${REPORT_DIR}/audit-report.html"
           </div>
           <span>📥</span>
         </a>
-        <a class="csv-card" href="unencrypted_s3_buckets.csv" download>
+        <a class="csv-card" href="public_s3_buckets.csv" download>
           <div>
-            <strong>unencrypted_s3_buckets.csv</strong><br>
-            <span>Buckets without default encryption</span>
+            <strong>public_s3_buckets.csv</strong><br>
+            <span>Buckets missing Block Public Access</span>
           </div>
           <span>📥</span>
         </a>
@@ -989,14 +999,19 @@ cat <<EOF > "${REPORT_DIR}/audit-report.html"
 EOF
 fi
 
+# Auto-package report bundle into ZIP (ensures dashboard download button never 404s)
+ZIP_FILE_NAME="audit-bundle-${CLIENT_NAME}-${DATE}.zip"
+ZIP_FILE="${REPORT_DIR}/${ZIP_FILE_NAME}"
+package_audit_zip "${REPORT_DIR}" "${ZIP_FILE_NAME}"
+
 # 7. Print Terminal Summary Dashboard
 IMDS_TOKEN=$(curl -s -m 1 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
 EC2_IP=$(curl -s -m 1 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || curl -s -m 2 http://checkip.amazonaws.com 2>/dev/null || echo "13.200.216.63")
 
-python3 - "${CLIENT_NAME}" "${DATE}" "${TIMESTAMP}" "${MOCK_COUNT:-0}" "${EC2_COUNT:-0}" "${S3_COUNT:-0}" "${IAM_ROLE_COUNT:-0}" "${RDS_COUNT:-0}" "${VPC_COUNT:-0}" "${UNENCRYPTED_S3:-0}" "${OPEN_SG:-0}" "${PUBLIC_RDS:-0}" "${UNENCRYPTED_RDS:-0}" << 'EOF'
+python3 - "${CLIENT_NAME}" "${DATE}" "${TIMESTAMP}" "${MOCK_COUNT:-0}" "${EC2_COUNT:-0}" "${S3_COUNT:-0}" "${IAM_ROLE_COUNT:-0}" "${RDS_COUNT:-0}" "${VPC_COUNT:-0}" "${PUBLIC_S3:-0}" "${OPEN_SG:-0}" "${PUBLIC_RDS:-0}" "${UNENCRYPTED_RDS:-0}" << 'EOF'
 import sys
 
-client, date, timestamp, mock_c, ec2_c, s3_c, iam_c, rds_c, vpc_c, unenc_s3, open_sg, pub_rds, unenc_rds = sys.argv[1:14]
+client, date, timestamp, mock_c, ec2_c, s3_c, iam_c, rds_c, vpc_c, pub_s3, open_sg, pub_rds, unenc_rds = sys.argv[1:14]
 
 W = 75
 top = "╔" + "═" * (W - 2) + "╗"
@@ -1033,15 +1048,15 @@ else:
     print("║" + f"   • VPC Networks:                 {vpc_c}".ljust(W - 2) + "║")
     print(mid)
     print("║" + " SECURITY HIGHLIGHTS:".ljust(W - 2) + "║")
-    u_s3 = int(unenc_s3) if unenc_s3.isdigit() else 0
+    p_s3 = int(pub_s3) if pub_s3.isdigit() else 0
     o_sg = int(open_sg) if open_sg.isdigit() else 0
     p_rds = int(pub_rds) if pub_rds.isdigit() else 0
     u_rds = int(unenc_rds) if unenc_rds.isdigit() else 0
-    s3_status = "[WARN]" if u_s3 > 0 else "[PASS]"
+    s3_status = "[WARN]" if p_s3 > 0 else "[PASS]"
     sg_status = "[WARN]" if o_sg > 0 else "[PASS]"
     p_rds_status = "[CRIT]" if p_rds > 0 else "[PASS]"
     u_rds_status = "[WARN]" if u_rds > 0 else "[PASS]"
-    print("║" + f"   {s3_status} Unencrypted S3 Buckets:      {u_s3}".ljust(W - 2) + "║")
+    print("║" + f"   {s3_status} Public Exposed S3 Buckets:   {p_s3}".ljust(W - 2) + "║")
     print("║" + f"   {sg_status} Open Security Groups:        {o_sg}".ljust(W - 2) + "║")
     print("║" + f"   {p_rds_status} Publicly Accessible RDS:     {p_rds}".ljust(W - 2) + "║")
     print("║" + f"   {u_rds_status} Unencrypted RDS Storage:       {u_rds}".ljust(W - 2) + "║")
@@ -1070,7 +1085,7 @@ cat <<EOF
 =======================================================
 Reports generated at: ${REPORT_DIR}
   • audit-report.html          (Styled Executive Report)
-  • unencrypted_s3_buckets.csv (CSV finding list)
+  • public_s3_buckets.csv      (CSV finding list)
   • open_security_groups.csv   (Exposed Security Groups finding list)
   • public_rds_instances.csv   (Public or unencrypted RDS instances)
   • ec2_inventory.csv          (Complete asset list)
@@ -1094,7 +1109,7 @@ cat <<EOF
 =======================================================
 Reports generated at: ${REPORT_DIR}
   • audit-report.html          (Styled Executive Report)
-  • unencrypted_s3_buckets.csv (CSV finding list)
+  • public_s3_buckets.csv      (CSV finding list)
   • open_security_groups.csv   (Exposed Security Groups finding list)
   • public_rds_instances.csv   (Public or unencrypted RDS instances)
   • ec2_inventory.csv          (Complete asset list)
@@ -1110,45 +1125,35 @@ EOF
 fi
 
 if [ -t 0 ]; then
-    echo ""
-    read -p "Would you like to bundle this report for download? [Y/n]: " DOWNLOAD_PROMPT
-    DOWNLOAD_PROMPT=${DOWNLOAD_PROMPT:-Y}
-    if [[ "$DOWNLOAD_PROMPT" =~ ^[Yy]$ ]]; then
-        ZIP_FILE="${REPORT_DIR}/audit-bundle-${CLIENT_NAME}-${DATE}.zip"
-        if command -v zip >/dev/null 2>&1; then
-            (cd "$(dirname "$REPORT_DIR")" && zip -r -q "$ZIP_FILE" "$(basename "$REPORT_DIR")")
-        else
-            (cd "$(dirname "$REPORT_DIR")" && python3 -m zipfile -c "$ZIP_FILE" "$(basename "$REPORT_DIR")")
-        fi
-        echo -e "\n\033[1;32m[SUCCESS]\033[0m Report bundle packaged: $(basename "$ZIP_FILE")"
-        if [ "$IS_EC2" = true ]; then
+    echo -e "\n\033[1;32m[SUCCESS]\033[0m Report bundle packaged: $(basename "$ZIP_FILE")"
+    if [ "$IS_EC2" = true ]; then
+        echo ""
+        echo "Choose download method:"
+        echo "  [1] Copy via SCP (requires SSH/.pem key)"
+        echo "  [2] Start 1-Click Browser Download Link (NO .pem or SSH needed - Download in Browser)"
+        echo "  [3] Skip / Done"
+        read -p "Select method [1, 2, or 3, default 2]: " DL_METHOD
+        DL_METHOD=${DL_METHOD:-2}
+        if [ "$DL_METHOD" = "1" ]; then
             echo ""
-            echo "Choose download method:"
-            echo "  [1] Copy via SCP (requires SSH/.pem key)"
-            echo "  [2] Start 1-Click Browser Download Link (NO .pem or SSH needed - Download in Browser)"
-            read -p "Select method [1 or 2, default 2]: " DL_METHOD
-            DL_METHOD=${DL_METHOD:-2}
-            if [ "$DL_METHOD" = "1" ]; then
-                echo ""
-                echo "Run this command on your laptop's terminal to download the ZIP package:"
-                echo -e "  \033[1;36mscp -i <YOUR_KEY.pem> ubuntu@${EC2_IP}:${ZIP_FILE} ./\033[0m"
-                echo ""
-                echo "Or without -i if using password/default key:"
-                echo -e "  \033[1;36mscp ubuntu@${EC2_IP}:${ZIP_FILE} ./\033[0m"
-                echo ""
-            else
-                serve_download_http "$REPORT_DIR" "$(basename "$ZIP_FILE")" 8080
-            fi
-        else
-            echo "Report bundle saved locally at: ${ZIP_FILE}"
-            read -p "Open HTML report in browser now? [Y/n]: " OPEN_LOCAL
-            OPEN_LOCAL=${OPEN_LOCAL:-Y}
-            if [[ "$OPEN_LOCAL" =~ ^[Yy]$ ]]; then
-                if [[ "$OSTYPE" == "darwin"* ]]; then
-                    open "${REPORT_DIR}/audit-report.html"
-                elif command -v xdg-open >/dev/null 2>&1; then
-                    xdg-open "${REPORT_DIR}/audit-report.html"
-                fi
+            echo "Run this command on your laptop's terminal to download the ZIP package:"
+            echo -e "  \033[1;36mscp -i <YOUR_KEY.pem> ubuntu@${EC2_IP}:${ZIP_FILE} ./\033[0m"
+            echo ""
+            echo "Or without -i if using password/default key:"
+            echo -e "  \033[1;36mscp ubuntu@${EC2_IP}:${ZIP_FILE} ./\033[0m"
+            echo ""
+        elif [ "$DL_METHOD" = "2" ]; then
+            serve_download_http "$REPORT_DIR" "$(basename "$ZIP_FILE")" 8080
+        fi
+    else
+        echo "Report bundle saved locally at: ${ZIP_FILE}"
+        read -p "Open HTML report in browser now? [Y/n]: " OPEN_LOCAL
+        OPEN_LOCAL=${OPEN_LOCAL:-Y}
+        if [[ "$OPEN_LOCAL" =~ ^[Yy]$ ]]; then
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+                open "${REPORT_DIR}/audit-report.html"
+            elif command -v xdg-open >/dev/null 2>&1; then
+                xdg-open "${REPORT_DIR}/audit-report.html"
             fi
         fi
     fi
